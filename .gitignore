@@ -1,0 +1,24 @@
+# 虚拟环境与工具缓存
+.venv/
+.uvcache/
+.uvpython/
+.uvhome/
+.uvtools/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 本地数据与日志（含买家昵称、订单号，绝不入库）
+data/
+logs/
+*.log
+*.log.*
+
+# 运行期 pid 文件（ctl.py 生成，记录当前实例）
+*.pid
+*.pid.tmp
+
+# 本地配置（含 new-api / 卡密站凭据）
+.env
+.ref/

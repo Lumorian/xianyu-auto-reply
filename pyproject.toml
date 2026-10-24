@@ -1,0 +1,49 @@
+[project]
+name = "xianyu-auto-reply"
+version = "0.1.0"
+description = "闲鱼自动发货工具：付款即发货、卡密出库、自动确认发货"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+# 扫描范围显式声明：别把临时脚本、老版本兼容层算进来
+extend-exclude = ["_patch_*.py", "_cleanup*.py", ".venv", "data", "logs"]
+
+[tool.ruff.lint]
+# 以前这里没写 select，规则集完全取决于装的是哪个 ruff 版本：
+# 同一份代码在不同机器上「有没有告警」都不一样，CI 结果不可复现。
+# 现在把需要的规则族钉死，顺带把当初写 noqa 的那套假设对上。
+select = [
+    "F",    # pyflakes
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "ASYNC",
+    "S",
+    "BLE",
+    "RUF",
+    "SLF",
+]
+ignore = [
+    "E501",    # 行宽由 formatter 管
+    "S101",    # 测试里大量 assert
+    "S311",    # random 用于退避抖动和设备指纹，不是密码学用途
+    "S105",    # 配置键名里带 token 字样，不是硬编码密钥
+    "S106",
+    "BLE001",  # 这个项目到处在「一条坏消息不能拖垮整条连接」地兜底
+    "SIM105",
+    "RUF001",  # 中文注释里的全角标点
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S108", "BLE001", "SIM117", "SLF001"]
+# upstream 的预热与回滚就是要在模块内部操作两个 client 的私有连接
+"app/upstream.py" = ["SLF001"]
+

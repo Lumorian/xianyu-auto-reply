@@ -1,0 +1,241 @@
+"""发货鉴权：光靠聊天文本不能发货。
+
+线上可复现的漏洞：把「我已付款，等待你发货」这句话自己打出来，
+正文匹配就成立，卡密/Key 直接被领走。这里把四条边界都钉住：
+
+1. 真人文本 + 未核实订单 → 不发；
+2. 真人文本 + 已核实订单 → 发；
+3. 系统卡片 → 发（但要带订单号）；
+4. 换成别人的订单号 → 核实不通过，不发。
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+
+import msgpack
+
+from app.db import Database
+from app.engine import DeliveryEngine
+from app.runner import AccountWorker
+
+MY = "4100000003"
+BUYER = "2000000000003"
+OTHER_BUYER = "9999999999"
+ITEM = "2000000000001"
+ORDER = "2500000000000000006"
+CHAT = "68100583197"
+
+
+def card_payload(*, text="[我已付款，等待你发货]", item=ITEM, order=ORDER,
+                 card=True, content_type=26):
+    """造一条买家消息。card=True 时带 dxCard（系统交易卡片）。"""
+    node = {"2": text, "4": content_type}
+    if card:
+        node["5"] = json.dumps({
+            "dxCard": {"item": {"main": {
+                "targetUrl": "fleamarket://order_detail?id=" + order + "&role=seller"
+            }}}
+        })
+    return {
+        "1": {
+            "1": {"1": BUYER + "@goofish"},
+            "2": CHAT + "@goofish",
+            "5": 1792817748592,
+            "6": {"1": 101, "3": node},
+            "10": {
+                "reminderContent": text,
+                "reminderTitle": "测试者-winkee",
+                "senderUserId": BUYER,
+                "reminderUrl": (
+                    "fleamarket://message_chat?itemId=" + item + "&peerUserId=" + BUYER
+                    + "&sid=" + CHAT + "&orderId=" + order
+                ),
+            },
+        },
+    }
+
+
+def frame_with(payload):
+    data = base64.b64encode(msgpack.packb(payload, use_bin_type=True)).decode()
+    return json.dumps({"headers": {"mid": "m1"}, "body": {"syncPushPackage": {"data": [{"data": data}]}}})
+
+
+def order(order_id=ORDER, buyer=BUYER, status="待发货"):
+    return {
+        "commonData": {"orderId": order_id, "itemId": ITEM, "orderStatus": status},
+        "buyerInfoVO": {"buyerId": buyer, "userNick": "示例酸酸"},
+        "priceVO": {"totalPrice": "1.00", "actualPayFee": "1.00"},
+    }
+
+
+class FakeClient:
+    user_id = MY
+
+    def __init__(self, orders=None):
+        self.sent = []
+        self.acked = []
+        self.confirmed = []
+        self.websocket = self
+        self.orders = orders or []
+
+    async def ack(self, ws, frame):
+        self.acked.append(frame)
+
+    async def send_text_safe(self, chat_id, to_id, text):
+        self.sent.append((chat_id, to_id, text))
+
+    async def confirm_shipping(self, order_id):
+        self.confirmed.append(order_id)
+        return True, "SUCCESS"
+
+    async def find_order(self, order_id):
+        for o in self.orders:
+            if str(o["commonData"]["orderId"]) == str(order_id):
+                return o
+        return None
+
+    async def close(self):
+        pass
+
+
+CARD_RULE = {
+    "name": "月卡", "item_id": "*", "enabled": True, "mode": "card",
+    "content": "卡密：{card}", "auto_confirm": False, "priority": 0, "remark": "",
+}
+
+
+async def build(db, orders=None, rule=None):
+    account_id = await db.upsert_account("主号", "unb=" + MY + "; _m_h5_tk=t")
+    account = await db.get_account(account_id)
+    await db.save_rule(dict(rule or CARD_RULE))
+    await db.add_cards(["CARD-0001"], "*")
+    worker = AccountWorker(db, account, DeliveryEngine(db))
+    worker.client = FakeClient(orders)
+    return worker
+
+
+# ---------------------------------------------------------------- 核心鉴权
+
+
+async def test_typed_paid_text_cannot_steal_a_card(db):
+    """买家自己打「我已付款」—— 订单查不到，不发，卡密一张不动。"""
+    worker = await build(db, orders=[])  # 闲鱼那边根本没有这个订单
+    payload = card_payload(card=False, content_type=1)
+    await worker._on_frame(frame_with(payload))
+
+    assert worker.client.sent == []
+    cards = await db.list_cards()
+    assert cards[0]["status"] == "available"
+
+    orders = await db.list_orders()
+    assert orders[0]["status"] == "blocked"
+    assert "核实" in orders[0]["detail"]
+
+
+async def test_typed_paid_text_with_real_paid_order_is_delivered(db):
+    """真人文本 + 订单确实待发货 → 正常发货（合法路径不能被误杀）。"""
+    worker = await build(db, orders=[order()])
+    payload = card_payload(card=False, content_type=1)
+    await worker._on_frame(frame_with(payload))
+
+    assert len(worker.client.sent) == 1
+    assert "CARD-0001" in worker.client.sent[0][2]
+
+
+async def test_unpaid_order_is_rejected(db):
+    """订单存在但还没付款/已关闭，一律不发。"""
+    for status in ("待付款", "交易关闭", "已发货", "退款中"):
+        database = Database(db.path.parent / f"t_{status}.db")
+        await database.init()
+        worker = await build(database, orders=[order(status=status)])
+        await worker._on_frame(frame_with(card_payload(card=False, content_type=1)))
+        assert worker.client.sent == [], status
+        assert (await database.list_cards())[0]["status"] == "available", status
+
+
+async def test_order_of_another_buyer_is_rejected(db):
+    """拿别人的订单号来触发发货 → 买家对不上，不发。"""
+    worker = await build(db, orders=[order(buyer=OTHER_BUYER)])
+    await worker._on_frame(frame_with(card_payload(card=False, content_type=1)))
+
+    assert worker.client.sent == []
+    assert (await db.list_cards())[0]["status"] == "available"
+
+
+async def test_system_card_is_trusted_without_lookup(db):
+    """系统交易卡片来自交易链路，不需要再查一次订单。"""
+    worker = await build(db, orders=[])  # 故意让 find_order 查不到
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert len(worker.client.sent) == 1
+
+
+async def test_card_without_order_id_is_rejected(db):
+    """没有订单号：没法去重也没法核归属，宁可不发。"""
+    worker = await build(db, orders=[])
+    payload = card_payload()
+    payload["1"]["10"]["reminderUrl"] = "fleamarket://message_chat?itemId=" + ITEM
+    payload["1"]["6"]["3"].pop("5", None)
+    await worker._on_frame(frame_with(payload))
+
+    assert worker.client.sent == []
+    assert (await db.list_cards())[0]["status"] == "available"
+
+
+# ---------------------------------------------------------------- 卡密不丢
+
+
+async def test_dry_run_does_not_consume_card(db, monkeypatch):
+    """DRY-RUN 跑一单不能把库存里的卡烧成 sold。"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "dry_run", True)
+    worker = await build(db, orders=[])
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert worker.client.sent == []
+    cards = await db.list_cards()
+    assert cards[0]["status"] == "available"
+
+
+async def test_create_chat_failure_releases_card(db):
+    """订单轮询那条路建会话失败，卡密要还回库存。"""
+    class BrokenChat(FakeClient):
+        async def create_chat(self, to_id, item_id):
+            from app.client import XianyuError
+
+            raise XianyuError("创建会话失败（code=400）")
+
+    account_id = await db.upsert_account("主号2", "unb=" + MY + "; _m_h5_tk=t")
+    account = await db.get_account(account_id)
+    await db.save_rule(dict(CARD_RULE))
+    await db.add_cards(["CARD-0002"], "*")
+    worker = AccountWorker(db, account, DeliveryEngine(db))
+    worker.client = BrokenChat()
+
+    ok = await worker._fulfil_order({
+        "order_id": ORDER, "item_id": ITEM, "buyer_id": BUYER,
+        "buyer_name": "示例酸酸", "raw": {},
+    })
+
+    assert ok is False
+    cards = {c["content"]: c for c in await db.list_cards()}
+    assert cards["CARD-0002"]["status"] == "available"
+    assert (await db.list_orders())[0]["status"] == "upstream_failed"
+
+
+# ---------------------------------------------------------------- 去重
+
+
+async def test_push_and_poll_do_not_process_the_same_message_twice(db):
+    """推送和拉会话列表会拿到同一条消息，只能记一条流水。"""
+    worker = await build(db, orders=[order()])
+    payload = card_payload(card=False, content_type=1, text="在吗？")
+    payload["1"]["3"] = "9999.PNM"  # messageId
+    await worker._on_frame(frame_with(payload))
+    await worker._on_frame(frame_with(payload))
+
+    messages = await db.list_messages()
+    assert len([m for m in messages if m["kind"] == "incoming"]) == 1

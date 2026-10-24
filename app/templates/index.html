@@ -1,0 +1,1525 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#ff6a00" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%90%9F%3C/text%3E%3C/svg%3E" />
+<title>闲鱼自动发货</title>
+<style>
+:root{
+  color-scheme:light;
+  --bg:#f5f6f8; --panel:#fff; --fg:#101828; --muted:#667085;
+  --line:#e8eaee; --line-strong:#d6dae1; --hover:#f8f9fb;
+  --acc:#ff6a00; --acc-hover:#ff7d1f; --acc-soft:#fff2e8; --acc-glow:rgba(255,106,0,.16);
+  --ok:#079455; --ok-soft:#e8f8ef; --warn:#b54708; --warn-soft:#fef3e2;
+  --err:#d92d20; --err-soft:#feeceb; --info:#175cd3; --info-soft:#eff6ff;
+  --shadow:0 1px 2px rgba(16,24,40,.04), 0 6px 20px -12px rgba(16,24,40,.18);
+  --radius:14px;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    color-scheme:dark;
+    --bg:#0d1017; --panel:#151922; --fg:#e7eaf0; --muted:#8b94a5;
+    --line:#232936; --line-strong:#303849; --hover:#1a1f2a;
+    --acc:#ff7a1a; --acc-hover:#ff8c38; --acc-soft:#2a1c10; --acc-glow:rgba(255,122,26,.22);
+    --ok:#3ccb7f; --ok-soft:#12261b; --warn:#f5a524; --warn-soft:#2a2110;
+    --err:#ff6b5e; --err-soft:#2b1513; --info:#6ba8ff; --info-soft:#101a2b;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 28px -14px rgba(0,0,0,.7);
+  }
+}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+a{color:inherit}
+code,.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:9px;border:3px solid var(--bg)}
+
+/* ---------- 布局 ---------- */
+.app{display:grid;grid-template-columns:228px minmax(0,1fr);min-height:100vh}
+.sidebar{position:sticky;top:0;height:100vh;background:var(--panel);border-right:1px solid var(--line);
+  padding:16px 12px;display:flex;flex-direction:column;gap:4px}
+.brand{display:flex;align-items:center;gap:10px;padding:6px 8px 16px}
+.logo{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;font-size:18px;
+  background:linear-gradient(140deg,var(--acc),#ff9a3d);box-shadow:0 6px 16px -8px var(--acc)}
+.brand-name{font-size:13.5px;font-weight:650;letter-spacing:-.01em}
+.brand-sub{font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}
+.nav{display:flex;flex-direction:column;gap:2px;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:9px;color:var(--muted);
+  text-decoration:none;font-size:13.5px;font-weight:500;transition:background .15s,color .15s}
+.nav-item svg{width:17px;height:17px;flex:none;stroke:currentColor;stroke-width:1.7;fill:none;
+  stroke-linecap:round;stroke-linejoin:round}
+.nav-item:hover{background:var(--hover);color:var(--fg)}
+.nav-item.active{background:var(--acc-soft);color:var(--acc);font-weight:600}
+.side-foot{margin-top:auto;padding:12px 8px 4px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
+.side-row{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--muted)}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.dot.err{background:var(--err);box-shadow:0 0 0 3px var(--err-soft)}
+.dot.warn{background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+.dot.live{animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.main{min-width:0;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);
+  padding:15px 28px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.topbar h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.015em}
+.topbar p{margin:2px 0 0;font-size:12.5px;color:var(--muted)}
+.top-actions{display:flex;align-items:center;gap:10px}
+.sync{font-size:11.5px;color:var(--muted);white-space:nowrap}
+.content{padding:22px 28px 72px;max-width:1240px;width:100%}
+.view{display:none;animation:fade .18s ease-out}
+.view.on{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ---------- 卡片 ---------- */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.card + .card{margin-top:16px}
+.card-h{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;
+  justify-content:space-between;gap:12px;flex-wrap:wrap;min-height:52px}
+.card-h h2{margin:0;font-size:14px;font-weight:620;letter-spacing:-.01em}
+.card-h .sub{font-size:12px;color:var(--muted);margin:1px 0 0}
+.card-b{padding:18px}
+.card-b.tight{padding:0}
+.grid2{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:16px;align-items:start}
+
+/* ---------- 统计 ---------- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:14px;margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:15px 17px;
+  box-shadow:var(--shadow);position:relative;overflow:hidden}
+.stat::after{content:"";position:absolute;left:0;top:0;width:3px;height:100%;background:var(--acc);opacity:.9}
+.stat.k-ok::after{background:var(--ok)}
+.stat.k-info::after{background:var(--info)}
+.stat .k{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.stat .v{font-size:27px;font-weight:660;letter-spacing:-.03em;margin-top:5px;
+  font-variant-numeric:tabular-nums;line-height:1.15}
+.stat .v small{font-size:13px;font-weight:500;color:var(--muted);margin-left:3px}
+.stat .s{font-size:11.5px;color:var(--muted);margin-top:3px}
+
+/* ---------- 表格 ---------- */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;
+  text-align:left;padding:9px 16px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--hover)}
+td{padding:11px 16px;border-bottom:1px solid var(--line);vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:var(--hover)}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+td.actions{text-align:right;white-space:nowrap}
+
+/* ---------- 徽标 ---------- */
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2.5px 9px;border-radius:999px;
+  font-size:11.5px;font-weight:550;line-height:1.5;white-space:nowrap}
+.pill .dot{width:5px;height:5px;box-shadow:none}
+.pill.ok{color:var(--ok);background:var(--ok-soft)}
+.pill.ok .dot{background:var(--ok)}
+.pill.warn{color:var(--warn);background:var(--warn-soft)}
+.pill.warn .dot{background:var(--warn)}
+.pill.err{color:var(--err);background:var(--err-soft)}
+.pill.err .dot{background:var(--err)}
+.pill.info{color:var(--info);background:var(--info-soft)}
+.pill.info .dot{background:var(--info)}
+.pill.plain{color:var(--muted);background:var(--hover)}
+.pill.plain .dot{background:var(--muted)}
+
+/* ---------- 按钮 ---------- */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:34px;padding:0 14px;
+  border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  font:inherit;font-size:13px;font-weight:520;cursor:pointer;white-space:nowrap;
+  transition:background .14s,border-color .14s,transform .06s,filter .14s}
+.btn:hover{background:var(--hover);border-color:var(--line-strong)}
+.btn:active{transform:translateY(1px)}
+.btn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--acc-glow)}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:#fff;
+  box-shadow:0 1px 2px rgba(0,0,0,.06),0 6px 16px -10px var(--acc)}
+.btn.primary:hover{background:var(--acc-hover);border-color:var(--acc-hover);filter:none}
+.btn.sm{height:28px;padding:0 10px;font-size:12px;border-radius:7px}
+.btn.icon{width:34px;padding:0}
+.btn.icon.sm{width:28px}
+.btn svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.8;fill:none;
+  stroke-linecap:round;stroke-linejoin:round}
+.link{background:none;border:none;padding:2px 6px;font:inherit;font-size:12.5px;color:var(--muted);
+  cursor:pointer;border-radius:6px}
+.link:hover{color:var(--acc);background:var(--acc-soft)}
+.link.danger:hover{color:var(--err);background:var(--err-soft)}
+
+/* ---------- 表单 ---------- */
+.in,select.in,textarea.in{width:100%;height:36px;padding:0 11px;border-radius:9px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);font:inherit;font-size:13px}
+textarea.in{height:auto;padding:10px 11px;resize:vertical;line-height:1.6}
+.in::placeholder{color:var(--muted);opacity:.75}
+.in:focus,select.in:focus,textarea.in:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-glow)}
+select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),
+  linear-gradient(135deg,var(--muted) 50%,transparent 50%);
+  background-position:calc(100% - 16px) 15px,calc(100% - 11px) 15px;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:32px}
+.field{display:flex;flex-direction:column;gap:5px;min-width:0}
+.field > span.lbl{font-size:12px;font-weight:540;color:var(--muted)}
+.field .hint{font-size:11.5px;color:var(--muted);opacity:.85}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.row > *{min-width:0}
+.check{display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;user-select:none;padding:7px 0}
+.check input{width:15px;height:15px;accent-color:var(--acc);cursor:pointer;margin:0}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px}
+
+/* ---------- 空状态 / 提示 ---------- */
+.empty{padding:38px 16px;text-align:center;color:var(--muted);font-size:13px}
+.empty .ic{font-size:26px;opacity:.5;margin-bottom:8px}
+.banner{display:flex;gap:11px;align-items:flex-start;padding:13px 16px;border-radius:12px;
+  font-size:12.8px;border:1px solid;line-height:1.6}
+.banner b{font-weight:620}
+.banner.ok{background:var(--ok-soft);border-color:transparent;color:var(--fg)}
+.banner.warn{background:var(--warn-soft);border-color:transparent;color:var(--fg)}
+.banner.err{background:var(--err-soft);border-color:transparent;color:var(--fg)}
+.banner .ic{font-size:15px;line-height:1.35}
+.banner code{background:rgba(127,127,127,.14);padding:1px 5px;border-radius:5px}
+.muted{color:var(--muted)}
+.tiny{font-size:11.5px}
+
+/* ---------- 账号条目 ---------- */
+.acc-list{display:flex;flex-direction:column}
+.acc{display:flex;align-items:center;gap:13px;padding:13px 18px;border-bottom:1px solid var(--line)}
+.acc:last-child{border-bottom:none}
+.acc .ava{width:34px;height:34px;border-radius:10px;background:var(--hover);display:grid;place-items:center;
+  font-size:15px;flex:none}
+.acc .who{min-width:0;flex:1}
+.acc .nm{font-weight:580;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acc .rm{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acc .ops{display:flex;gap:2px;flex:none}
+
+/* ---------- 二维码 ---------- */
+.qr-wrap{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+.qr-shot{position:relative;width:196px;height:196px;flex:none;border-radius:14px;overflow:hidden;
+  border:1px solid var(--line);background:#fff;display:grid;place-items:center}
+.qr-shot img{width:100%;height:100%;object-fit:contain;display:block}
+.qr-meta{flex:1;min-width:200px}
+.qr-meta h3{margin:0 0 6px;font-size:15px;font-weight:620}
+.qr-meta p{margin:0 0 10px;font-size:12.5px;color:var(--muted);line-height:1.7}
+
+/* ---------- 模态 ---------- */
+.modal{position:fixed;inset:0;z-index:80;display:none;align-items:flex-start;justify-content:center;
+  padding:5vh 16px;background:rgba(9,11,15,.5);overflow-y:auto}
+.modal.open{display:flex;animation:fade .16s ease-out}
+.modal-box{width:100%;max-width:660px;background:var(--panel);border:1px solid var(--line);
+  border-radius:16px;box-shadow:0 28px 70px -24px rgba(0,0,0,.55);margin:auto}
+.modal-h{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:16px 20px;border-bottom:1px solid var(--line)}
+.modal-h h2{margin:0;font-size:15px;font-weight:640}
+.modal-b{padding:20px;display:flex;flex-direction:column;gap:16px}
+.modal-f{display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid var(--line);
+  background:var(--hover)}
+.preview{background:var(--hover);border:1px solid var(--line);border-radius:10px;padding:12px 14px;
+  white-space:pre-wrap;font-size:12.5px;margin:0;line-height:1.7;color:var(--fg);
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-height:190px;overflow:auto}
+
+/* ---------- toast ---------- */
+#toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:120;max-width:380px}
+.toast{background:#101828;color:#fff;padding:11px 15px;border-radius:10px;font-size:13px;
+  box-shadow:0 12px 32px -10px rgba(0,0,0,.55);animation:slide .2s ease-out;word-break:break-word}
+.toast.err{background:var(--err)}
+@keyframes slide{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* ---------- 移动端 ---------- */
+@media (max-width:880px){
+  .app{grid-template-columns:1fr}
+  .sidebar{position:static;height:auto;flex-direction:row;align-items:center;gap:8px;
+    padding:10px 12px;overflow-x:auto;border-right:none;border-bottom:1px solid var(--line)}
+  .brand{padding:0 8px 0 2px;flex:none}
+  .brand-sub{display:none}
+  .nav{flex-direction:row;gap:4px;margin:0}
+  .nav-item{padding:7px 11px;white-space:nowrap;font-size:13px}
+  .nav-item span{display:none}
+  .nav-item.active span{display:inline}
+  .side-foot{display:none}
+  .topbar{padding:13px 16px}
+  .content{padding:16px 16px 64px}
+  .grid2{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">🐟</div>
+      <div>
+        <div class="brand-name">闲鱼自动发货</div>
+        <div class="brand-sub">auto-delivery</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a class="nav-item" data-view="overview" href="#overview">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span>总览</span>
+      </a>
+      <a class="nav-item" data-view="accounts" href="#accounts">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.6"/><path d="M4.5 20c.6-3.8 3.8-6 7.5-6s6.9 2.2 7.5 6"/></svg>
+        <span>账号</span>
+      </a>
+      <a class="nav-item" data-view="rules" href="#rules">
+        <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2.2"/><circle cx="10" cy="17" r="2.2"/></svg>
+        <span>发货规则</span>
+      </a>
+      <a class="nav-item" data-view="replies" href="#replies">
+        <svg viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 0 1-12.4 7.5L3.5 21l1.6-4.4A8.5 8.5 0 1 1 20.5 12z"/><path d="M8.5 9.5h7M8.5 13h4.5"/></svg>
+        <span>自动回复</span>
+      </a>
+      <a class="nav-item" data-view="orders" href="#orders">
+        <svg viewBox="0 0 24 24"><path d="M20 8.5 12 4 4 8.5v7L12 20l8-4.5z"/><path d="M4 8.5 12 13l8-4.5M12 13v7"/></svg>
+        <span>发货记录</span>
+      </a>
+      <a class="nav-item" data-view="cards" href="#cards">
+        <svg viewBox="0 0 24 24"><circle cx="8" cy="9" r="3.2"/><path d="M10.4 11.4 20 21M17 18l2-2M14.5 15.5l2-2"/></svg>
+        <span>卡密池</span>
+      </a>
+      <a class="nav-item" data-view="messages" href="#messages">
+        <svg viewBox="0 0 24 24"><path d="M20 12.5c0 3.6-3.6 6.5-8 6.5-1 0-2-.15-2.9-.42L5 20l1.1-3.2A6.4 6.4 0 0 1 4 12.5C4 8.9 7.6 6 12 6s8 2.9 8 6.5z"/></svg>
+        <span>消息流水</span>
+      </a>
+      <a class="nav-item" data-view="settings" href="#settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 3.5v2.2M12 18.3v2.2M4.9 7.9l1.9 1.1M17.2 15l1.9 1.1M4.9 16.1l1.9-1.1M17.2 9l1.9-1.1"/></svg>
+        <span>设置</span>
+      </a>
+    </nav>
+    <div class="side-foot">
+      <div class="side-row" id="side-upstream"><span class="dot"></span><span>上游检测中…</span></div>
+      <div class="side-row" id="side-mode"><span class="dot ok"></span><span>正式发货</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">总览</h1>
+        <p id="page-sub">运行状况一眼看完</p>
+      </div>
+      <div class="top-actions">
+        <span class="sync" id="sync">—</span>
+        <button class="btn icon" onclick="refresh(true)" title="立即刷新">
+          <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="content">
+
+      <!-- ============ 总览 ============ -->
+      <section class="view" id="view-overview">
+        <div class="stats" id="stats"></div>
+        <div id="overview-banner"></div>
+        <div class="grid2" style="margin-top:16px">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>最近发货</h2><p class="sub">最新的 6 条记录</p></div>
+              <a class="btn sm" href="#orders">全部记录</a>
+            </div>
+            <div class="card-b tight tw"><table>
+              <thead><tr><th>时间</th><th>买家</th><th>金额</th><th>状态</th></tr></thead>
+              <tbody id="ov-orders"></tbody>
+            </table></div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>账号状态</h2><p class="sub">长连接是否在线</p></div>
+              <a class="btn sm" href="#accounts">管理</a>
+            </div>
+            <div class="acc-list" id="ov-accounts"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 账号 ============ -->
+      <section class="view" id="view-accounts">
+        <div class="card">
+          <div class="card-h">
+            <div><h2>扫码登录</h2><p class="sub">推荐方式，扫完自动保存并开始监听</p></div>
+          </div>
+          <div class="card-b">
+            <div class="row" style="margin-bottom:14px">
+              <div class="field" style="flex:1;min-width:200px;max-width:260px">
+                <span class="lbl">账号备注名</span>
+                <input class="in" id="login-name" placeholder="例如：主号" />
+              </div>
+              <button class="btn primary" onclick="startQr()">
+                <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="6" height="6" rx="1"/><rect x="14.5" y="3.5" width="6" height="6" rx="1"/><rect x="3.5" y="14.5" width="6" height="6" rx="1"/><path d="M14.5 14.5h3v3h-3zM20 20h.01"/></svg>
+                生成二维码
+              </button>
+            </div>
+            <div id="qr-area" class="qr-wrap" style="display:none">
+              <div class="qr-shot"><img id="qr-img" alt="登录二维码" /></div>
+              <div class="qr-meta">
+                <h3 id="qr-title">等待扫码</h3>
+                <p id="qr-status" class="muted">用手机闲鱼 App 右上角「扫一扫」，扫完在手机上点确认。</p>
+                <p class="muted tiny">二维码 3 分钟内有效。扫不出来就把手机和电脑换成同一个网络。</p>
+                <button class="btn sm" onclick="cancelQr()">取消</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h">
+            <div><h2>手工粘贴 Cookie</h2><p class="sub">扫码不方便时用这个</p></div>
+          </div>
+          <div class="card-b">
+            <p class="muted tiny" style="margin:0 0 12px">
+              浏览器登录 <a href="https://www.goofish.com" target="_blank" rel="noopener" style="color:var(--acc)">goofish.com</a>
+              → F12 → Network → 任意请求的 Request Headers → 复制整条 Cookie。必须包含 <code>unb</code> 和 <code>_m_h5_tk</code>。
+            </p>
+            <div class="form-grid" style="margin-bottom:12px">
+              <label class="field"><span class="lbl">账号备注名</span><input class="in" id="acc-name" placeholder="例如：主号" /></label>
+              <label class="field"><span class="lbl">备注（可选）</span><input class="in" id="acc-remark" placeholder="随便写点" /></label>
+            </div>
+            <label class="field"><span class="lbl">Cookie</span>
+              <textarea class="in" id="acc-cookie" rows="3" placeholder="unb=xxx; _m_h5_tk=xxx; ..."></textarea>
+            </label>
+            <div class="row" style="margin-top:12px">
+              <button class="btn primary" onclick="saveAccount()">保存并连接</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h">
+            <div><h2>已添加的账号</h2><p class="sub" id="acc-count">—</p></div>
+          </div>
+          <div class="acc-list" id="accounts"></div>
+        </div>
+      </section>
+
+      <!-- ============ 规则 ============ -->
+      <section class="view" id="view-rules">
+        <div id="rules-banner" style="margin-bottom:16px"></div>
+        <div class="card">
+          <div class="card-h">
+            <div><h2>发货规则</h2><p class="sub">一条规则 = 什么商品 + 发什么</p></div>
+            <button class="btn primary" onclick="openRule()">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              新建规则
+            </button>
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>规则</th><th>商品</th><th>模式</th><th>额度策略</th><th>自动确认</th><th>状态</th><th></th></tr></thead>
+            <tbody id="rules"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ============ 自动回复 ============ -->
+      <section class="view" id="view-replies">
+        <div id="reply-banner" style="margin-bottom:16px"></div>
+
+        <div class="stats" id="reply-stats"></div>
+
+        <div class="card">
+          <div class="card-h">
+            <div><h2>商品自动回复</h2>
+              <p class="sub">买家针对这个商品说任何话，就回这条（适合「在的，拍下自动发货」）</p></div>
+            <button class="btn primary" onclick="openReply(null,'item')">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              新建商品回复
+            </button>
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>规则</th><th>商品</th><th>回复内容</th><th>频率限制</th><th>状态</th><th></th></tr></thead>
+            <tbody id="reply-item-rules"></tbody>
+          </table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-h">
+            <div><h2>关键词自动回复</h2>
+              <p class="sub">买家说的话里带关键词才回（适合「发货」「怎么用」「能便宜吗」）</p></div>
+            <button class="btn primary" onclick="openReply(null,'keyword')">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              新建关键词回复
+            </button>
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>规则</th><th>商品</th><th>关键词</th><th>回复内容</th><th>频率限制</th><th>状态</th><th></th></tr></thead>
+            <tbody id="reply-keyword-rules"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ============ 设置 ============ -->
+      <section class="view" id="view-settings">
+        <div id="settings-banner" style="margin-bottom:16px"></div>
+
+        <div class="card">
+          <div class="card-h">
+            <div><h2>Key 模型限制</h2>
+              <p class="sub">每卖出一单都会新建一个 Key —— 这里决定这些 Key 能调哪些模型</p></div>
+          </div>
+          <div class="card-b">
+            <div class="field">
+              <span class="lbl">允许的模型（逗号 / 空格 / 换行分隔）</span>
+              <textarea class="in" id="set-model-limits" rows="3"
+                placeholder="deepseek-v4.1-flash, deepseek-v4.1"
+                oninput="updateModelLimitsPreview()"></textarea>
+              <span class="hint">留空 = 不限制（买家可以拿 Key 调任意模型，慎用）。
+                支持中文逗号，保存时自动去空格、去重。</span>
+            </div>
+
+            <div class="field" style="margin-top:4px">
+              <span class="lbl">保存后新 Key 会变成这样</span>
+              <pre class="preview" id="set-model-limits-preview"></pre>
+            </div>
+
+            <div class="row" style="margin-top:16px;gap:10px;align-items:center">
+              <button class="btn primary" onclick="saveSettings()">保存设置</button>
+              <button class="btn" onclick="resetModelLimits()">恢复默认值</button>
+              <span class="tiny muted" id="set-model-limits-source"></span>
+            </div>
+
+            <p class="tiny muted" style="margin:14px 0 0;line-height:1.8">
+              · 保存后立即对新订单生效，<b>不用重启、也不用改 .env</b>。<br />
+              · 只影响<b>之后新建</b>的 Key；已经发出去的旧 Key 要去 new-api 后台逐个改。<br />
+              · 这里存的是运营参数；账号、密码这类凭据仍然只从 .env 读取。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 发货记录 ============ -->
+      <section class="view" id="view-orders">
+        <div class="card">
+          <div class="card-h">
+            <div><h2>发货记录</h2><p class="sub" id="orders-count">—</p></div>
+            <div class="row" style="flex:0 0 auto;gap:8px">
+              <input class="in" id="orders-q" placeholder="搜订单号 / 买家 / 商品" style="width:230px" oninput="renderOrders()" />
+              <select class="in" id="orders-status" style="width:128px" onchange="renderOrders()">
+                <option value="">全部状态</option>
+                <option value="delivered">已发货</option>
+                <option value="send_failed">发送失败</option>
+                <option value="upstream_failed">上游失败</option>
+              </select>
+            </div>
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>时间</th><th>订单号</th><th>买家</th><th>金额</th><th>额度</th><th>状态</th><th>详情</th></tr></thead>
+            <tbody id="orders"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ============ 卡密池 ============ -->
+      <section class="view" id="view-cards">
+        <div class="card">
+          <div class="card-h">
+            <div><h2>导入卡密</h2><p class="sub">只有「本地卡密池」模式才用得上</p></div>
+          </div>
+          <div class="card-b">
+            <div class="row" style="margin-bottom:12px">
+              <label class="field" style="max-width:230px">
+                <span class="lbl">归属商品</span>
+                <input class="in" id="card-item" value="*" placeholder="商品ID，* = 通用池" />
+              </label>
+              <button class="btn primary" onclick="addCards()">导入</button>
+            </div>
+            <label class="field"><span class="lbl">每行一条</span>
+              <textarea class="in" id="card-text" rows="4" placeholder="账号----密码&#10;账号2----密码2"></textarea>
+            </label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">
+            <div><h2>卡密库存</h2><p class="sub" id="stock">—</p></div>
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>ID</th><th>商品</th><th>内容</th><th>状态</th><th>订单</th><th></th></tr></thead>
+            <tbody id="cards"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ============ 消息 ============ -->
+      <section class="view" id="view-messages">
+        <div class="card">
+          <div class="card-h">
+            <div><h2>消息流水</h2><p class="sub" id="msgs-count">—</p></div>
+            <input class="in" id="msgs-q" placeholder="搜买家 / 内容" style="width:230px" oninput="renderMessages()" />
+          </div>
+          <div class="card-b tight tw"><table>
+            <thead><tr><th>时间</th><th>方向</th><th>对方</th><th>内容</th></tr></thead>
+            <tbody id="messages"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<!-- ============ 规则弹窗 ============ -->
+<div class="modal" id="rule-modal">
+  <div class="modal-box">
+    <div class="modal-h">
+      <h2 id="rule-modal-title">新建规则</h2>
+      <button class="btn icon sm" onclick="closeRule()" title="关闭">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-b">
+      <div class="form-grid">
+        <label class="field"><span class="lbl">规则名（必填）</span>
+          <input class="in" id="rule-name" placeholder="例如：会员月卡" /></label>
+        <label class="field"><span class="lbl">发货模式</span>
+          <select class="in" id="rule-mode" onchange="onRuleMeta()">
+            <option value="upstream">按订单金额建 Key（推荐）</option>
+            <option value="card">本地卡密池</option>
+            <option value="text">固定文案</option>
+          </select></label>
+      </div>
+      <div class="form-grid">
+        <label class="field"><span class="lbl">商品 ID</span>
+          <input class="in" id="rule-item" placeholder="* 表示全部商品" value="*" oninput="onRuleMeta()" /></label>
+        <div class="field"><span class="lbl">从在售商品选</span>
+          <div style="display:flex;gap:6px">
+            <select class="in" id="rule-item-pick" onchange="pickItem(this.value)">
+              <option value="">— 先刷新列表 —</option>
+            </select>
+            <button class="btn" onclick="loadItems()" title="拉取我的在售商品" style="flex:none">刷新</button>
+          </div></div>
+        <label class="field"><span class="lbl">优先级（大的先匹配）</span>
+          <input class="in" id="rule-priority" type="number" placeholder="0" value="0" /></label>
+      </div>
+      <div class="form-grid" id="rule-upstream-fields">
+        <label class="field"><span class="lbl">金额倍率</span>
+          <input class="in" id="rule-mult" type="number" step="0.01" value="1" oninput="onRuleMeta()" /></label>
+        <label class="field"><span class="lbl">固定额度 USD（0 = 按订单金额）</span>
+          <input class="in" id="rule-fixed" type="number" step="0.01" value="0" oninput="onRuleMeta()" /></label>
+      </div>
+      <p class="tiny muted" id="quota-note" style="margin:-6px 0 0"></p>
+      <label class="check"><input type="checkbox" id="rule-confirm" checked />
+        发完自动点「无需物流发货」</label>
+      <label class="field"><span class="lbl">发货文案</span>
+        <textarea class="in" id="rule-content" rows="5" oninput="updatePreview()"
+          placeholder="可用变量：{card} 卡密 / {buyer} 买家 / {amount} 订单金额 / {quota} 额度 / {item_id} / {order_id} / {date}"></textarea>
+      </label>
+      <div class="field">
+        <span class="lbl">买家会收到这样的消息</span>
+        <pre class="preview" id="rule-preview"></pre>
+      </div>
+    </div>
+    <div class="modal-f">
+      <button class="btn" onclick="closeRule()">取消</button>
+      <button class="btn primary" onclick="saveRule()">保存规则</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 自动回复弹窗 ============ -->
+<div class="modal" id="reply-modal">
+  <div class="modal-box">
+    <div class="modal-h">
+      <h2 id="reply-modal-title">新建自动回复</h2>
+      <button class="btn icon sm" onclick="closeReply()" title="关闭">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-b">
+      <div class="form-grid">
+        <label class="field"><span class="lbl">规则名（必填）</span>
+          <input class="in" id="reply-name" placeholder="例如：在售商品打招呼" /></label>
+        <label class="field"><span class="lbl">回复类型</span>
+          <select class="in" id="reply-kind" onchange="onReplyMeta()">
+            <option value="keyword">关键词自动回复</option>
+            <option value="item">商品自动回复</option>
+          </select></label>
+      </div>
+      <div class="form-grid">
+        <label class="field"><span class="lbl">商品 ID</span>
+          <input class="in" id="reply-item" placeholder="* 表示全部商品" value="*" /></label>
+        <div class="field"><span class="lbl">从在售商品选</span>
+          <div style="display:flex;gap:6px">
+            <select class="in" id="reply-item-pick" onchange="pickReplyItem(this.value)">
+              <option value="">— 先刷新列表 —</option>
+            </select>
+            <button class="btn" onclick="loadItemsFor('reply-item-pick','reply-item')" style="flex:none">刷新</button>
+          </div></div>
+        <label class="field"><span class="lbl">优先级（大的先匹配）</span>
+          <input class="in" id="reply-priority" type="number" placeholder="0" value="0" /></label>
+      </div>
+      <div class="form-grid" id="reply-keyword-fields">
+        <label class="field" style="grid-column:1/-1"><span class="lbl">关键词（逗号 / 分号 / 换行分隔）</span>
+          <input class="in" id="reply-keywords" placeholder="发货, 多久, 怎么用" oninput="updateReplyPreview()" /></label>
+        <label class="field"><span class="lbl">匹配方式</span>
+          <select class="in" id="reply-match" onchange="updateReplyPreview()">
+            <option value="contains">包含关键词（推荐）</option>
+            <option value="exact">完全一致（整句相同）</option>
+            <option value="regex">正则表达式（高级）</option>
+          </select></label>
+      </div>
+      <p class="tiny muted" id="reply-kind-note" style="margin:-6px 0 0"></p>
+      <div class="form-grid">
+        <label class="field"><span class="lbl">冷却秒数（同一买家，0 = 不限）</span>
+          <input class="in" id="reply-cooldown" type="number" value="60" /></label>
+        <label class="check" style="align-self:end"><input type="checkbox" id="reply-once" checked />
+          同一会话只回一次</label>
+      </div>
+      <label class="field"><span class="lbl">回复内容</span>
+        <textarea class="in" id="reply-content" rows="5" oninput="updateReplyPreview()"
+          placeholder="可用变量：{buyer} 买家 / {item_id} 商品 / {order_id} 订单号 / {keyword} 命中的关键词 / {date} 时间"></textarea>
+      </label>
+      <div class="field">
+        <span class="lbl">买家会收到这样的消息</span>
+        <pre class="preview" id="reply-preview"></pre>
+      </div>
+    </div>
+    <div class="modal-f">
+      <button class="btn" onclick="closeReply()">取消</button>
+      <button class="btn primary" onclick="saveReply()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script>
+var TOKEN = new URLSearchParams(location.search).get("token") || "";
+var S = { accounts: [], status: [], rules: [], replyRules: [], cards: [], stock: [], orders: [], messages: [], cfg: null };
+var QR_TIMER = null, QR_SID = null, ITEM_PRICES = {}, EDIT_ID = null, TICK = 0;
+var REPLY_EDIT_ID = null;
+
+var VIEWS = ["overview", "accounts", "rules", "replies", "orders", "cards", "messages", "settings"];
+var TITLES = {
+  overview: ["总览", "运行状况一眼看完"],
+  accounts: ["账号", "登录闲鱼账号，管理长连接"],
+  rules: ["发货规则", "一条规则决定什么商品发什么内容"],
+  replies: ["自动回复", "商品 / 关键词命中就自动回一条私信"],
+  orders: ["发货记录", "每一单的结果都在这里"],
+  cards: ["卡密池", "本地卡密的进口与出库"],
+  messages: ["消息流水", "收到和发出的每一条私信"],
+  settings: ["设置", "Key 能调哪些模型，在这里改"]
+};
+
+/* ---------- 基础工具 ---------- */
+function headers(extra) {
+  var o = { "Content-Type": "application/json" };
+  if (TOKEN) o["X-Admin-Token"] = TOKEN;
+  if (extra) for (var k in extra) o[k] = extra[k];
+  return o;
+}
+async function api(path, opts) {
+  var options = Object.assign({}, opts || {});
+  options.headers = headers(options.headers);
+  var res = await fetch(path, options);
+  if (!res.ok) throw new Error(await explainError(res));
+  return res.status === 204 ? null : res.json();
+}
+async function explainError(res) {
+  var body = null;
+  try { body = await res.json(); } catch (e) {}
+  var detail = body && body.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(function (d) {
+      var field = (d.loc || []).filter(function (x) { return x !== "body"; }).join(".");
+      var names = { name: "规则名", item_id: "商品ID", mode: "模式", content: "发货文案" };
+      var label = names[field] || field || "参数";
+      if (d.type === "string_too_short") return label + "不能为空";
+      return label + "：" + (d.msg || "格式不对");
+    }).join("；");
+  }
+  return res.statusText || ("HTTP " + res.status);
+}
+function toast(msg, isError) {
+  var el = document.createElement("div");
+  el.className = "toast" + (isError ? " err" : "");
+  el.textContent = msg;
+  document.getElementById("toasts").appendChild(el);
+  setTimeout(function () { el.remove(); }, 3400);
+}
+function esc(s) {
+  // 单引号也必须转义：页面上大量属性是用 ' 拼的（title='…' / value='…'），
+  // 而值里可能是买家昵称、闲鱼商品标题这些第三方可控文本。
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+function pad(n) { return n < 10 ? "0" + n : "" + n; }
+function nfmt(n) { return Number(n || 0).toLocaleString("zh-CN"); }
+function yuan(n) { return n == null ? "—" : "¥" + Number(n).toFixed(2); }
+function usd(n) { return n == null ? "—" : "$" + Number(n).toFixed(2); }
+function relTime(s) {
+  if (!s) return "—";
+  var d = new Date(String(s).replace(" ", "T")).getTime();
+  if (!isFinite(d)) return esc(s);
+  var diff = (Date.now() - d) / 1000;
+  if (diff < 45) return "刚刚";
+  if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+  if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
+  if (diff < 86400 * 7) return Math.floor(diff / 86400) + " 天前";
+  return esc(s);
+}
+function emptyRow(cols, text, icon) {
+  return "<tr><td colspan='" + cols + "'><div class='empty'><div class='ic'>" + (icon || "○") + "</div><div>" + esc(text) + "</div></div></td></tr>";
+}
+
+/* ---------- 路由 ---------- */
+function currentView() {
+  var v = (location.hash || "#overview").slice(1);
+  return VIEWS.indexOf(v) >= 0 ? v : "overview";
+}
+function applyView() {
+  var v = currentView();
+  VIEWS.forEach(function (name) {
+    document.getElementById("view-" + name).classList.toggle("on", name === v);
+  });
+  document.querySelectorAll(".nav-item").forEach(function (el) {
+    el.classList.toggle("active", el.dataset.view === v);
+  });
+  document.getElementById("page-title").textContent = TITLES[v][0];
+  document.getElementById("page-sub").textContent = TITLES[v][1];
+  window.scrollTo(0, 0);
+}
+window.addEventListener("hashchange", applyView);
+
+/* ---------- 扫码登录 ---------- */
+async function startQr() {
+  var name = document.getElementById("login-name").value.trim() || "闲鱼账号";
+  try {
+    var r = await api("/api/login/start", { method: "POST", body: JSON.stringify({ name: name, remark: "" }) });
+    QR_SID = r.session_id;
+    document.getElementById("qr-area").style.display = "flex";
+    document.getElementById("qr-img").src = "/api/login/" + r.session_id + "/qrcode?t=" + Date.now();
+    document.getElementById("qr-title").textContent = "等待扫码";
+    document.getElementById("qr-status").className = "muted";
+    document.getElementById("qr-status").textContent = "用手机闲鱼 App 扫左边的二维码";
+    if (QR_TIMER) clearInterval(QR_TIMER);
+    QR_TIMER = setInterval(function () { pollQr(r.session_id); }, 2000);
+  } catch (e) { toast(e.message, true); }
+}
+function cancelQr() {
+  if (QR_TIMER) { clearInterval(QR_TIMER); QR_TIMER = null; }
+  document.getElementById("qr-area").style.display = "none";
+}
+async function pollQr(sid) {
+  try {
+    var r = await api("/api/login/" + sid + "/poll");
+    document.getElementById("qr-title").textContent = r.status_text || r.status;
+    document.getElementById("qr-status").textContent = r.status === "SCANNED" ? "已扫码，请在手机上确认" : "";
+    if (r.status === "CONFIRMED" && r.account_id) {
+      cancelQr();
+      toast("登录成功" + (r.nick ? "：" + r.nick : "") + "，已开始监听私信");
+      refresh(true);
+    } else if (r.status === "EXPIRED" || r.status === "CANCELED" || r.status === "ERROR") {
+      cancelQr();
+      toast(r.error || r.status_text || "二维码已失效", true);
+    }
+  } catch (e) { /* 单次失败不打断轮询 */ }
+}
+
+/* ---------- 账号 ---------- */
+async function saveAccount() {
+  var name = document.getElementById("acc-name").value.trim();
+  if (!name) { toast("填一个账号备注名", true); document.getElementById("acc-name").focus(); return; }
+  try {
+    await api("/api/accounts", { method: "POST", body: JSON.stringify({
+      name: name,
+      cookie: document.getElementById("acc-cookie").value.trim(),
+      remark: document.getElementById("acc-remark").value.trim(),
+      enabled: true }) });
+    document.getElementById("acc-cookie").value = "";
+    toast("已保存，正在连接闲鱼");
+    refresh(true);
+  } catch (e) { toast(e.message, true); }
+}
+async function toggleAccount(id, enabled) {
+  try { await api("/api/accounts/" + id + "/toggle?enabled=" + enabled, { method: "POST" }); refresh(true); }
+  catch (e) { toast(e.message, true); }
+}
+async function removeAccount(id) {
+  if (!confirm("删除该账号？连接会立刻断开。")) return;
+  try { await api("/api/accounts/" + id, { method: "DELETE" }); refresh(true); }
+  catch (e) { toast(e.message, true); }
+}
+async function fetchItems() {
+  if (!S.accounts.length) { toast("先登录一个闲鱼账号", true); return null; }
+  try {
+    var items = await api("/api/accounts/" + S.accounts[0].id + "/items");
+    ITEM_PRICES = {};
+    for (var i = 0; i < items.length; i++) {
+      var num = parseFloat(String(items[i].price).replace(/[^0-9.]/g, ""));
+      if (isFinite(num) && num > 0) ITEM_PRICES[items[i].item_id] = num;
+    }
+    toast(items.length ? "拉到 " + items.length + " 个在售商品" : "在售商品是空的（或接口权限不足）");
+    return items;
+  } catch (e) { toast(e.message, true); return null; }
+}
+function fillItemPick(selectId, inputId, items) {
+  var sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">— 从我的在售商品里选 —</option>' + items.map(function (it) {
+    return '<option value="' + esc(it.item_id) + '">' + esc(it.title) + " (¥" + esc(it.price) + ")</option>";
+  }).join("");
+  sel.onchange = function () { if (this.value) document.getElementById(inputId).value = this.value; };
+}
+async function loadItemsFor(selectId, inputId) {
+  var items = await fetchItems();
+  if (items) fillItemPick(selectId, inputId, items);
+}
+async function loadItems() {
+  var items = await fetchItems();
+  if (!items) return;
+  fillItemPick("rule-item-pick", "rule-item", items);
+  document.getElementById("rule-item-pick").onchange = function () { pickItem(this.value); };
+  onRuleMeta();
+}
+function pickItem(v) { if (v) { document.getElementById("rule-item").value = v; onRuleMeta(); } }
+
+/* ---------- 规则弹窗 ---------- */
+function openRule(id) {
+  EDIT_ID = id || null;
+  var r = null;
+  if (EDIT_ID) {
+    for (var i = 0; i < S.rules.length; i++) if (S.rules[i].id === EDIT_ID) r = S.rules[i];
+  }
+  document.getElementById("rule-modal-title").textContent = r ? "编辑规则" : "新建规则";
+  document.getElementById("rule-name").value = r ? r.name : "";
+  document.getElementById("rule-mode").value = r ? r.mode : "upstream";
+  document.getElementById("rule-item").value = r ? r.item_id : "*";
+  document.getElementById("rule-priority").value = r ? r.priority : 0;
+  document.getElementById("rule-mult").value = r ? r.usd_multiplier : 1;
+  document.getElementById("rule-fixed").value = r ? r.fixed_usd : 0;
+  document.getElementById("rule-confirm").checked = r ? !!r.auto_confirm : true;
+  document.getElementById("rule-content").value = r ? r.content : "";
+  if (!r) {
+    document.getElementById("rule-content").value =
+      "你好 {buyer}，这是你的卡密：\n\n{card}\n\n额度 {quota} 美元，如有问题直接回复本消息。";
+  }
+  onRuleMeta();
+  document.getElementById("rule-modal").classList.add("open");
+  setTimeout(function () { document.getElementById("rule-name").focus(); }, 60);
+}
+function closeRule() {
+  document.getElementById("rule-modal").classList.remove("open");
+  EDIT_ID = null;
+}
+function onRuleMeta() {
+  var mode = document.getElementById("rule-mode").value;
+  document.getElementById("rule-upstream-fields").style.display = mode === "upstream" ? "grid" : "none";
+  updateQuotaNote();
+  updatePreview();
+}
+// 「额度」的单位由 new-api 站点决定（quota_display_type）。站点设成 CNY 时
+// 额度就是人民币，直接写 $ 会让人以为发的是美元，看着像多发了好几倍。
+function quotaUnit() {
+  var cur = (S.cfg && S.cfg.newapi && S.cfg.newapi.currency) || "USD";
+  return cur === "CNY" ? "¥" : cur === "CUSTOM" ? "¤" : "$";
+}
+function updateQuotaNote() {
+  var el = document.getElementById("quota-note");
+  var mode = document.getElementById("rule-mode").value;
+  if (mode !== "upstream" || !S.cfg) { el.textContent = ""; return; }
+  var fixed = Number(document.getElementById("rule-fixed").value || 0);
+  var mult = Number(document.getElementById("rule-mult").value || 1);
+  var rate = S.cfg.cny_per_usd || 1;
+  var unit = quotaUnit();
+  if (fixed > 0) { el.textContent = "额度固定为 " + unit + fixed.toFixed(2) + "，不看订单金额"; return; }
+  var picked = ITEM_PRICES[document.getElementById("rule-item").value.trim()];
+  var parts = [];
+  if (picked) parts.push("本商品 ¥" + picked + " → " + unit + ((picked / rate) * mult).toFixed(2));
+  parts.push("¥10 → " + unit + ((10 / rate) * mult).toFixed(2));
+  parts.push("¥50 → " + unit + ((50 / rate) * mult).toFixed(2));
+  el.textContent = parts.join("　·　") + "　（" + rate + " 元 = " + unit + "1）";
+}
+function sampleQuota() {
+  var fixed = Number(document.getElementById("rule-fixed").value || 0);
+  if (fixed > 0) return fixed;
+  var mult = Number(document.getElementById("rule-mult").value || 1);
+  var rate = (S.cfg && S.cfg.cny_per_usd) || 1;
+  var picked = ITEM_PRICES[document.getElementById("rule-item").value.trim()];
+  return ((picked || 10) / rate) * mult;
+}
+function updatePreview() {
+  var tpl = document.getElementById("rule-content").value;
+  var el = document.getElementById("rule-preview");
+  if (!tpl.trim()) { el.textContent = "（文案是空的，买家会收到一条空消息）"; return; }
+  var sample = {
+    buyer: "小明",
+    item_id: document.getElementById("rule-item").value.trim() || "*",
+    order_id: "2500000000000000001",
+    card: "ABCDE-FGHIJ-KLMNO-PQRST",
+    date: new Date().toLocaleString("zh-CN"),
+    amount: "10.00",
+    quota: sampleQuota().toFixed(2)
+  };
+  var out = tpl;
+  for (var k in sample) out = out.split("{" + k + "}").join(sample[k]);
+  el.textContent = out;
+}
+async function saveRule() {
+  var name = document.getElementById("rule-name").value.trim();
+  if (!name) { toast("规则名不能为空", true); document.getElementById("rule-name").focus(); return; }
+  var content = document.getElementById("rule-content").value;
+  if (!content.trim()) { toast("发货文案不能为空，否则买家会收到空消息", true); return; }
+  var body = JSON.stringify({
+    name: name,
+    item_id: document.getElementById("rule-item").value.trim() || "*",
+    mode: document.getElementById("rule-mode").value,
+    content: content,
+    auto_confirm: document.getElementById("rule-confirm").checked,
+    priority: Number(document.getElementById("rule-priority").value || 0),
+    usd_multiplier: Number(document.getElementById("rule-mult").value || 1),
+    fixed_usd: Number(document.getElementById("rule-fixed").value || 0),
+    enabled: true
+  });
+  try {
+    if (EDIT_ID) await api("/api/rules/" + EDIT_ID, { method: "PUT", body: body });
+    else await api("/api/rules", { method: "POST", body: body });
+    closeRule();
+    toast(EDIT_ID ? "规则已更新" : "规则已保存");
+    refresh(true);
+  } catch (e) { toast(e.message, true); }
+}
+async function removeRule(id) {
+  if (!confirm("删除该规则？")) return;
+  try { await api("/api/rules/" + id, { method: "DELETE" }); refresh(true); }
+  catch (e) { toast(e.message, true); }
+}
+
+
+/* ---------- 自动回复 ---------- */
+var REPLY_SAMPLE = { buyer: "小明", item_id: "900052644277", order_id: "2500000000000000001",
+                     keyword: "发货", date: new Date().toLocaleString("zh-CN") };
+
+function openReply(id, kind) {
+  REPLY_EDIT_ID = id || null;
+  var r = null;
+  if (REPLY_EDIT_ID) {
+    for (var i = 0; i < S.replyRules.length; i++) if (S.replyRules[i].id === REPLY_EDIT_ID) r = S.replyRules[i];
+  }
+  document.getElementById("reply-modal-title").textContent = r ? "编辑自动回复" : "新建自动回复";
+  document.getElementById("reply-name").value = r ? r.name : "";
+  document.getElementById("reply-kind").value = r ? r.kind : (kind || "keyword");
+  document.getElementById("reply-item").value = r ? r.item_id : "*";
+  document.getElementById("reply-priority").value = r ? r.priority : 0;
+  document.getElementById("reply-keywords").value = r ? r.keywords : "";
+  document.getElementById("reply-match").value = r ? r.match_type : "contains";
+  document.getElementById("reply-cooldown").value = r ? r.cooldown : 60;
+  document.getElementById("reply-once").checked = r ? !!r.once_per_chat : true;
+  document.getElementById("reply-content").value = r ? r.content : "";
+  if (!r) {
+    var k = kind || "keyword";
+    document.getElementById("reply-content").value = k === "item"
+      ? "在的 {buyer}～这个商品拍下就自动发货，有问题直接在这里问我。"
+      : "你好 {buyer}，关于「{keyword}」：这个商品拍下会自动发货，卡密直接发到这个会话里。";
+  }
+  document.getElementById("reply-item-pick").innerHTML = '<option value="">— 先点刷新 —</option>';
+  onReplyMeta();
+  document.getElementById("reply-modal").classList.add("open");
+  setTimeout(function () { document.getElementById("reply-name").focus(); }, 60);
+}
+function closeReply() {
+  document.getElementById("reply-modal").classList.remove("open");
+  REPLY_EDIT_ID = null;
+}
+function onReplyMeta() {
+  var kind = document.getElementById("reply-kind").value;
+  document.getElementById("reply-keyword-fields").style.display = kind === "keyword" ? "grid" : "none";
+  var note = document.getElementById("reply-kind-note");
+  note.textContent = kind === "keyword"
+    ? "只有买家说的话里命中关键词才会回；商品填 * 表示所有商品都适用。"
+    : "买家针对这个商品发来任何一句话就回一次，不用写关键词。";
+  updateReplyPreview();
+}
+function pickReplyItem(v) { if (v) document.getElementById("reply-item").value = v; }
+function updateReplyPreview() {
+  var tpl = document.getElementById("reply-content").value;
+  var el = document.getElementById("reply-preview");
+  if (!tpl.trim()) { el.textContent = "（内容为空，保存不了）"; return; }
+  var keywords = document.getElementById("reply-keywords").value.split(/[,，;；|｜\n]+/);
+  var sample = Object.assign({}, REPLY_SAMPLE, {
+    keyword: (keywords[0] || "").trim() || "发货",
+    item_id: document.getElementById("reply-item").value.trim() || "*"
+  });
+  var out = tpl;
+  for (var k in sample) out = out.split("{" + k + "}").join(sample[k]);
+  el.textContent = out;
+}
+async function saveReply() {
+  var name = document.getElementById("reply-name").value.trim();
+  if (!name) { toast("规则名不能为空", true); document.getElementById("reply-name").focus(); return; }
+  var kind = document.getElementById("reply-kind").value;
+  var keywords = document.getElementById("reply-keywords").value.trim();
+  if (kind === "keyword" && !keywords) {
+    toast("关键词自动回复必须填关键词", true);
+    document.getElementById("reply-keywords").focus();
+    return;
+  }
+  var content = document.getElementById("reply-content").value;
+  if (!content.trim()) { toast("回复内容不能为空，否则买家会收到空消息", true); return; }
+  var body = JSON.stringify({
+    name: name,
+    kind: kind,
+    item_id: document.getElementById("reply-item").value.trim() || "*",
+    keywords: kind === "keyword" ? keywords : "",
+    match_type: document.getElementById("reply-match").value,
+    content: content,
+    enabled: true,
+    once_per_chat: document.getElementById("reply-once").checked,
+    cooldown: Number(document.getElementById("reply-cooldown").value || 0),
+    priority: Number(document.getElementById("reply-priority").value || 0),
+    remark: ""
+  });
+  var editing = REPLY_EDIT_ID;
+  try {
+    if (editing) await api("/api/reply-rules/" + editing, { method: "PUT", body: body });
+    else await api("/api/reply-rules", { method: "POST", body: body });
+    closeReply();
+    toast(editing ? "自动回复已更新" : "自动回复已保存");
+    refresh(true);
+  } catch (e) { toast(e.message, true); }
+}
+async function removeReply(id) {
+  if (!confirm("删除这条自动回复？")) return;
+  try { await api("/api/reply-rules/" + id, { method: "DELETE" }); refresh(true); }
+  catch (e) { toast(e.message, true); }
+}
+async function toggleReply(id, enabled) {
+  try {
+    await api("/api/reply-rules/" + id + "/toggle?enabled=" + enabled, { method: "POST" });
+    toast(enabled ? "已启用" : "已停用");
+    refresh(true);
+  } catch (e) { toast(e.message, true); }
+}
+async function resetReply(id) {
+  if (!confirm("清空这条规则的回复记录？清空后买家再发消息会重新自动回复一次。")) return;
+  try { await api("/api/reply-rules/" + id + "/reset", { method: "POST" }); toast("已清空回复记录"); }
+  catch (e) { toast(e.message, true); }
+}
+function replyLimitText(r) {
+  var parts = [];
+  parts.push(r.once_per_chat ? "会话只回一次" : "同一会话可重复");
+  if (Number(r.cooldown) > 0) parts.push("冷却 " + r.cooldown + " 秒");
+  return parts.join(" · ");
+}
+function replyPreview(txt) {
+  var one = String(txt || "").replace(/\s+/g, " ").trim();
+  return "<span title='" + esc(txt) + "'>" + esc(one.slice(0, 46)) + (one.length > 46 ? "…" : "") + "</span>";
+}
+function renderReplies() {
+  var banner = document.getElementById("reply-banner");
+  var items = S.replyRules.filter(function (r) { return r.kind === "item"; });
+  var keywords = S.replyRules.filter(function (r) { return r.kind !== "item"; });
+  var enabled = S.replyRules.filter(function (r) { return r.enabled; }).length;
+
+  var off = S.cfg && S.cfg.auto_reply && !S.cfg.auto_reply.enabled;
+  banner.innerHTML = off
+    ? "<div class='banner warn'><span class='ic'>⚠️</span><div><b>自动回复已关闭</b> —— " +
+      "<code>XY_AUTO_REPLY=0</code>，规则保存了也不会触发。改回 1 重启即可。</div></div>"
+    : "";
+
+  document.getElementById("reply-stats").innerHTML = [
+    { k: "商品自动回复", v: items.length, u: "条", s: "买家说任何话就回", cls: "k-info" },
+    { k: "关键词自动回复", v: keywords.length, u: "条", s: "命中关键词才回", cls: "" },
+    { k: "启用中", v: enabled, u: "/ " + S.replyRules.length, s: enabled ? "正在生效" : "一条都没启用", cls: "k-ok" }
+  ].map(function (c) {
+    return "<div class='stat " + c.cls + "'><div class='k'>" + esc(c.k) + "</div>" +
+      "<div class='v'>" + c.v + "<small>" + esc(c.u) + "</small></div>" +
+      "<div class='s'>" + esc(c.s) + "</div></div>";
+  }).join("");
+
+  var stateCell = function (r) {
+    return r.enabled ? "<span class='pill ok'><span class='dot'></span>启用</span>"
+                     : "<span class='pill plain'><span class='dot'></span>停用</span>";
+  };
+  var actions = function (r) {
+    return "<td class='actions'><button class='link' onclick='openReply(" + r.id + ")'>编辑</button>" +
+      "<button class='link' onclick='toggleReply(" + r.id + "," + (!r.enabled) + ")'>" +
+      (r.enabled ? "停用" : "启用") + "</button>" +
+      "<button class='link' onclick='resetReply(" + r.id + ")'>重置记录</button>" +
+      "<button class='link danger' onclick='removeReply(" + r.id + ")'>删除</button></td>";
+  };
+
+  document.getElementById("reply-item-rules").innerHTML = items.length ? items.map(function (r) {
+    return "<tr><td><b>" + esc(r.name) + "</b></td>" +
+      "<td><code>" + esc(r.item_id) + "</code></td>" +
+      "<td class='muted tiny'>" + replyPreview(r.content) + "</td>" +
+      "<td class='muted tiny'>" + esc(replyLimitText(r)) + "</td>" +
+      "<td>" + stateCell(r) + "</td>" + actions(r) + "</tr>";
+  }).join("") : emptyRow(6, "还没有商品自动回复 —— 点右上角新建一条", "💬");
+
+  document.getElementById("reply-keyword-rules").innerHTML = keywords.length ? keywords.map(function (r) {
+    var words = String(r.keywords || "").split(/[,，;；|｜\n]+/).filter(function (w) { return w.trim(); });
+    var matchName = r.match_type === "exact" ? "完全一致" : r.match_type === "regex" ? "正则" : "包含";
+    return "<tr><td><b>" + esc(r.name) + "</b></td>" +
+      "<td><code>" + esc(r.item_id) + "</code></td>" +
+      "<td>" + words.map(function (w) {
+        return "<span class='pill plain' style='margin:1px 2px'><span class='dot'></span>" + esc(w.trim()) + "</span>";
+      }).join("") + " <span class='muted tiny'>" + esc(matchName) + "</span></td>" +
+      "<td class='muted tiny'>" + replyPreview(r.content) + "</td>" +
+      "<td class='muted tiny'>" + esc(replyLimitText(r)) + "</td>" +
+      "<td>" + stateCell(r) + "</td>" + actions(r) + "</tr>";
+  }).join("") : emptyRow(7, "还没有关键词自动回复 —— 点右上角新建一条", "🔍");
+}
+
+/* ---------- 卡密 ---------- */
+async function addCards() {
+  try {
+    var r = await api("/api/cards", { method: "POST", body: JSON.stringify({
+      item_id: document.getElementById("card-item").value.trim() || "*",
+      raw_text: document.getElementById("card-text").value }) });
+    document.getElementById("card-text").value = "";
+    toast("已导入 " + r.added + " 条卡密");
+    refresh(true);
+  } catch (e) { toast(e.message, true); }
+}
+async function removeCard(id) {
+  if (!confirm("删除该卡密？")) return;
+  try { await api("/api/cards/" + id, { method: "DELETE" }); refresh(true); }
+  catch (e) { toast(e.message, true); }
+}
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); toast("已复制"); }
+  catch (e) { toast("复制失败，请手动选中", true); }
+}
+
+/* ---------- 渲染 ---------- */
+function statePill(st) {
+  var map = {
+    online: ["ok", "在线"], connecting: ["warn", "连接中"], idle: ["plain", "未启动"],
+    disconnected: ["warn", "已断开"], stopped: ["plain", "已停止"],
+    error: ["err", "异常"], cookie_expired: ["err", "Cookie 失效"],
+    risk_control: ["warn", "风控验证中"], token_expired: ["warn", "Token 刷新中"]
+  };
+  var m = map[st] || ["plain", st || "未知"];
+  return "<span class='pill " + m[0] + "'><span class='dot" + (st === "online" ? " live" : "") + "'></span>" + esc(m[1]) + "</span>";
+}
+function orderPill(status) {
+  var map = {
+    delivered: ["ok", "已发货"],
+    send_failed: ["err", "发送失败"],
+    upstream_failed: ["warn", "上游失败"]
+  };
+  var m = map[status] || ["plain", status];
+  return "<span class='pill " + m[0] + "'><span class='dot'></span>" + esc(m[1]) + "</span>";
+}
+
+function renderStats() {
+  var delivered = S.orders.filter(function (o) { return o.status === "delivered"; });
+  var now = new Date();
+  var todayKey = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate());
+  var today = delivered.filter(function (o) { return String(o.created_at || "").indexOf(todayKey) === 0; });
+  var sumToday = today.reduce(function (a, o) { return a + (Number(o.amount_cny) || 0); }, 0);
+  var sumAll = delivered.reduce(function (a, o) { return a + (Number(o.amount_cny) || 0); }, 0);
+  var stock = S.stock.reduce(function (a, s) { return a + (Number(s.available) || 0); }, 0);
+  var online = S.status.filter(function (s) { return s.status === "online"; }).length;
+  var failed = S.orders.filter(function (o) { return o.status !== "delivered"; }).length;
+
+  var cards = [
+    { k: "今日发货", v: nfmt(today.length), u: "单", s: "累计 " + nfmt(delivered.length) + " 单", cls: "k-ok" },
+    { k: "今日成交额", v: yuan(sumToday), u: "", s: "累计 " + yuan(sumAll), cls: "" },
+    { k: "在线账号", v: nfmt(online), u: "/ " + nfmt(S.accounts.length), s: online ? "长连接正常" : "没有在线账号", cls: "k-info" },
+    { k: "可用卡密", v: nfmt(stock), u: "条", s: failed ? (failed + " 单待处理") : "无需处理", cls: "" }
+  ];
+  document.getElementById("stats").innerHTML = cards.map(function (c) {
+    return "<div class='stat " + c.cls + "'><div class='k'>" + esc(c.k) + "</div>" +
+      "<div class='v'>" + c.v + (c.u ? "<small>" + esc(c.u) + "</small>" : "") + "</div>" +
+      "<div class='s'>" + esc(c.s) + "</div></div>";
+  }).join("");
+}
+
+function renderOverviewBanner() {
+  var box = document.getElementById("overview-banner");
+  if (!S.cfg) { box.innerHTML = ""; return; }
+  var out = "";
+  if (S.cfg.dry_run) {
+    out += "<div class='banner warn' style='margin-bottom:12px'><span class='ic'>🧪</span><div>" +
+      "<b>当前是 DRY-RUN 模式</b> —— 只会打日志，不会真的发消息、也不会建 Key。" +
+      "确认流程跑通后把 <code>XY_DRY_RUN=0</code> 再重启。</div></div>";
+  }
+  if (!S.cfg.upstream_ready) {
+    out += "<div class='banner err'><span class='ic'>⚠️</span><div>" +
+      "<b>上游未配置齐全</b> —— 选了「按订单金额建 Key」的规则会直接失败。" +
+      "检查 <code>.env</code> 里的 <code>XY_NEWAPI_*</code> 与 <code>XY_CARDSHOP_*</code>。</div></div>";
+  } else if (S.accounts.length && S.rules.length === 0) {
+    out += "<div class='banner warn'><span class='ic'>💡</span><div>" +
+      "<b>还没配发货规则</b> —— 有买家付款也不会发货，去「发货规则」建一条。</div></div>";
+  } else if (S.rules.length && !S.orders.length) {
+    out += "<div class='banner ok'><span class='ic'>🚀</span><div>" +
+      "<b>配置好了，可以试一单</b> —— 用另一个号拍下商品并付款，" +
+      "正常的话 1~2 秒内卡密就会发到买家私信里，然后这一页会多一条记录。</div></div>";
+  }
+  box.innerHTML = out;
+}
+
+function renderOverviewLists() {
+  var recent = S.orders.slice(0, 6);
+  document.getElementById("ov-orders").innerHTML = recent.length ? recent.map(function (o) {
+    return "<tr><td class='num muted tiny' title='" + esc(o.created_at) + "'>" + relTime(o.created_at) + "</td>" +
+      "<td>" + esc(o.buyer_name || o.buyer_id || "—") + "</td>" +
+      "<td class='num'>" + yuan(o.amount_cny) + "</td>" +
+      "<td>" + orderPill(o.status) + "</td></tr>";
+  }).join("") : emptyRow(4, "还没有发货记录，先从「账号」登录一个号", "📦");
+
+  var stateOf = {};
+  S.status.forEach(function (s) { stateOf[s.account_id] = s; });
+  document.getElementById("ov-accounts").innerHTML = S.accounts.length ? S.accounts.map(function (a) {
+    var st = stateOf[a.id] || { status: a.enabled ? "connecting" : "stopped", last_error: "" };
+    return "<div class='acc'><div class='ava'>" + (a.enabled ? "🐟" : "💤") + "</div>" +
+      "<div class='who'><div class='nm'>" + esc(a.name) + "</div>" +
+      "<div class='rm'>" + esc(st.last_error || a.remark || ("ID " + a.id)) + "</div></div>" +
+      "<div class='ops'>" + statePill(st.status) + "</div></div>";
+  }).join("") : "<div class='empty'><div class='ic'>👤</div><div>还没有账号，去「账号」页扫码登录</div></div>";
+}
+
+function renderAccounts() {
+  var stateOf = {};
+  S.status.forEach(function (s) { stateOf[s.account_id] = s; });
+  document.getElementById("acc-count").textContent = S.accounts.length
+    ? "共 " + S.accounts.length + " 个" : "还没有";
+  document.getElementById("accounts").innerHTML = S.accounts.length ? S.accounts.map(function (a) {
+    var st = stateOf[a.id] || { status: a.enabled ? "connecting" : "stopped", last_error: "" };
+    return "<div class='acc'><div class='ava'>" + (a.enabled ? "🐟" : "💤") + "</div>" +
+      "<div class='who'><div class='nm'>" + esc(a.name) + "</div>" +
+      "<div class='rm'>" + (st.last_error
+        ? "<span style='color:var(--err)'>" + esc(st.last_error) + "</span>"
+        : esc(a.remark || "没有备注")) + "</div></div>" +
+      "<div class='ops'>" + statePill(st.status) +
+      "<button class='link' onclick='toggleAccount(" + a.id + "," + (!a.enabled) + ")'>" +
+      (a.enabled ? "停用" : "启用") + "</button>" +
+      "<button class='link danger' onclick='removeAccount(" + a.id + ")'>删除</button></div></div>";
+  }).join("") : "<div class='empty'><div class='ic'>👤</div><div>还没有账号，用上面的扫码登录添加</div></div>";
+}
+
+function renderRules() {
+  var banner = document.getElementById("rules-banner");
+  if (S.cfg) {
+    if (!S.cfg.upstream_ready) {
+      banner.innerHTML = "<div class='banner warn'><span class='ic'>⚠️</span><div>" +
+        "<b>上游未配置</b> —— 可以先用「本地卡密池」或「固定文案」模式，“按订单金额建 Key”要等 new-api / 卡密站配好。</div></div>";
+    } else {
+      var models = S.cfg.newapi.model_limits || "";
+      banner.innerHTML = "<div class='banner ok'><span class='ic'>✅</span><div><b>上游已接通</b>　" +
+        "new-api <code>" + esc(S.cfg.newapi.base_url) + "</code> → 卡密站 <code>" + esc(S.cfg.cardshop.base_url) +
+        "</code>　·　" + S.cfg.cny_per_usd + " 元 = " + quotaUnit() + "1　·　" +
+        (models ? "新建 Key 仅限 <code>" + esc(models) + "</code>" : "<b style='color:var(--err)'>新建 Key 不限模型</b>") +
+        "</div></div>";
+    }
+  }
+  document.getElementById("rules").innerHTML = S.rules.length ? S.rules.map(function (r) {
+    var strategy = r.mode !== "upstream" ? "<span class='muted'>—</span>"
+      : (Number(r.fixed_usd) > 0 ? "固定 " + usd(r.fixed_usd)
+        : "金额 × " + r.usd_multiplier + " ÷ 汇率");
+    var modeName = r.mode === "upstream" ? "上游建 Key" : r.mode === "card" ? "本地卡密池" : "固定文案";
+    var modeCls = r.mode === "upstream" ? "info" : r.mode === "card" ? "plain" : "plain";
+    return "<tr><td><b>" + esc(r.name) + "</b></td>" +
+      "<td><code>" + esc(r.item_id) + "</code></td>" +
+      "<td><span class='pill " + modeCls + "'><span class='dot'></span>" + modeName + "</span></td>" +
+      "<td class='muted tiny'>" + strategy + "</td>" +
+      "<td class='muted tiny'>" + (r.auto_confirm ? "是" : "否") + "</td>" +
+      "<td>" + (r.enabled ? "<span class='pill ok'><span class='dot'></span>启用</span>"
+                          : "<span class='pill plain'><span class='dot'></span>停用</span>") + "</td>" +
+      "<td class='actions'><button class='link' onclick='openRule(" + r.id + ")'>编辑</button>" +
+      "<button class='link danger' onclick='removeRule(" + r.id + ")'>删除</button></td></tr>";
+  }).join("") : emptyRow(7, "还没有规则 —— 点右上角「新建规则」", "⚙️");
+}
+
+function renderOrders() {
+  var q = (document.getElementById("orders-q").value || "").trim().toLowerCase();
+  var st = document.getElementById("orders-status").value;
+  var rows = S.orders.filter(function (o) {
+    if (st && o.status !== st) return false;
+    if (!q) return true;
+    var hay = [o.order_id, o.item_id, o.buyer_name, o.buyer_id, o.card_code].join(" ").toLowerCase();
+    return hay.indexOf(q) >= 0;
+  });
+  document.getElementById("orders-count").textContent = S.orders.length
+    ? "共 " + S.orders.length + " 条" + (rows.length !== S.orders.length ? "，筛出 " + rows.length + " 条" : "")
+    : "还没有记录";
+  document.getElementById("orders").innerHTML = rows.length ? rows.map(function (o) {
+    var detail = o.detail || (o.card_code ? "卡密 " + o.card_code : "");
+    return "<tr><td class='num muted' title='" + esc(o.created_at) + "'>" + relTime(o.created_at) + "</td>" +
+      "<td><code>" + esc(o.order_id || "—") + "</code></td>" +
+      "<td>" + esc(o.buyer_name || o.buyer_id || "—") + "</td>" +
+      "<td class='num'>" + yuan(o.amount_cny) + "</td>" +
+      "<td class='num'>" + usd(o.quota_usd) + "</td>" +
+      "<td>" + orderPill(o.status) + "</td>" +
+      "<td class='muted tiny' style='max-width:280px'>" + esc(detail || "—") + "</td></tr>";
+  }).join("") : emptyRow(7, q || st ? "没有匹配的记录" : "还没有发货记录", "📦");
+}
+
+function renderCards() {
+  var total = S.stock.reduce(function (a, s) { return a + (Number(s.available) || 0); }, 0);
+  document.getElementById("stock").textContent = S.stock.length
+    ? "共 " + total + " 条可用　·　" + S.stock.map(function (s) {
+        return (s.item_id || "*") + " → " + s.available;
+      }).join("　·　")
+    : "暂无可用卡密";
+  document.getElementById("cards").innerHTML = S.cards.length ? S.cards.map(function (c) {
+    return "<tr><td class='num muted'>" + c.id + "</td>" +
+      "<td><code>" + esc(c.item_id) + "</code></td>" +
+      "<td><code>" + esc(c.content) + "</code></td>" +
+      "<td>" + (c.status === "available"
+        ? "<span class='pill ok'><span class='dot'></span>可售</span>"
+        : "<span class='pill plain'><span class='dot'></span>已售</span>") + "</td>" +
+      "<td class='muted tiny'>" + esc(c.order_id || "—") + "</td>" +
+      "<td class='actions'><button class='link danger' onclick='removeCard(" + c.id + ")'>删除</button></td></tr>";
+  }).join("") : emptyRow(6, "还没有卡密，把卡密粘到上面的框里导入", "🔑");
+}
+
+function renderMessages() {
+  var q = (document.getElementById("msgs-q").value || "").trim().toLowerCase();
+  var rows = S.messages.filter(function (m) {
+    if (!q) return true;
+    return ((m.sender_name || "") + " " + (m.content || "") + " " + (m.sender_id || "")).toLowerCase().indexOf(q) >= 0;
+  });
+  document.getElementById("msgs-count").textContent = S.messages.length
+    ? "最近 " + S.messages.length + " 条" + (rows.length !== S.messages.length ? "，筛出 " + rows.length + " 条" : "")
+    : "还没有消息";
+  document.getElementById("messages").innerHTML = rows.length ? rows.map(function (m) {
+    var out = m.kind === "outgoing";
+    return "<tr><td class='num muted' title='" + esc(m.created_at) + "'>" + relTime(m.created_at) + "</td>" +
+      "<td>" + (out ? "<span class='pill info'><span class='dot'></span>发出</span>"
+                     : "<span class='pill plain'><span class='dot'></span>收到</span>") + "</td>" +
+      "<td>" + esc(m.sender_name || m.sender_id || "—") + "</td>" +
+      "<td style='max-width:520px'>" + esc((m.content || "").slice(0, 110)) + "</td></tr>";
+  }).join("") : emptyRow(4, q ? "没有匹配的消息" : "还没有消息", "💬");
+}
+
+/* ---------- 设置 ---------- */
+var SETTINGS_DIRTY = false;
+var MODEL_LIMITS_SOURCE = { web: "来自后台设置", env: "来自 .env（XY_NEWAPI_MODEL_LIMITS）", "default": "内置默认值" };
+
+// 与后端 normalize_model_limits 同一规则：中文逗号 → 英文，按空白/逗号切开，去空去重
+function normalizeModelLimits(raw) {
+  var text = String(raw == null ? "" : raw).replace(/，/g, ",");
+  var out = [];
+  text.split(",").forEach(function (chunk) {
+    chunk.split(/\s+/).forEach(function (name) {
+      if (name && out.indexOf(name) < 0) out.push(name);
+    });
+  });
+  return out.join(",");
+}
+
+function updateModelLimitsPreview() {
+  SETTINGS_DIRTY = true;
+  var models = normalizeModelLimits(document.getElementById("set-model-limits").value);
+  var prev = document.getElementById("set-model-limits-preview");
+  if (!prev) return;
+  prev.textContent = models
+    ? 'model_limits_enabled = true\nmodel_limits = "' + models + '"'
+    : 'model_limits_enabled = false   ← 不限制模型，买家可调任意模型';
+}
+
+function renderSettings() {
+  if (!S.cfg) return;
+  var box = document.getElementById("settings-banner");
+  var info = S.cfg.newapi || {};
+  if (info.model_limits_unlimited) {
+    box.innerHTML = "<div class='banner warn'><span class='ic'>⚠️</span><div>" +
+      "<b>新建的 Key 目前不限模型</b> —— 买家拿到 Key 能调任意（更贵的）模型。" +
+      "在下面填上允许的模型并保存即可，不用改 .env。</div></div>";
+  } else {
+    box.innerHTML = "<div class='banner ok'><span class='ic'>✅</span><div>" +
+      "<b>新建 Key 仅限 <code>" + esc(info.model_limits) + "</code></b>" +
+      " —— 买家拿 Key 也调不了别的模型。</div></div>";
+  }
+  // 只在用户没在编辑时回填，否则每 5 秒刷新会把手里的输入冲掉
+  var input = document.getElementById("set-model-limits");
+  if (input && !SETTINGS_DIRTY && document.activeElement !== input) {
+    input.value = info.model_limits || "";
+    updateModelLimitsPreview();
+    SETTINGS_DIRTY = false;
+  }
+  var src = document.getElementById("set-model-limits-source");
+  if (src) {
+    src.textContent = MODEL_LIMITS_SOURCE[info.model_limits_source] || "";
+  }
+}
+
+async function saveSettings() {
+  var models = normalizeModelLimits(document.getElementById("set-model-limits").value);
+  if (!models) {
+    if (!confirm("留空 = 之后新建的 Key 不限制模型，买家可以调用任意模型。\n确定要这样吗？")) return;
+  }
+  try {
+    var r = await api("/api/config/settings", {
+      method: "PUT", body: JSON.stringify({ model_limits: models })
+    });
+    SETTINGS_DIRTY = false;
+    document.getElementById("set-model-limits").value = r.model_limits.value || "";
+    toast(models ? "已保存，新建 Key 仅限 " + models : "已保存：新建 Key 不限制模型");
+    await refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+function resetModelLimits() {
+  var input = document.getElementById("set-model-limits");
+  input.value = "deepseek-v4.1-flash";
+  SETTINGS_DIRTY = true;
+  updateModelLimitsPreview();
+}
+
+function renderSide() {
+  var up = document.getElementById("side-upstream");
+  if (S.cfg && S.cfg.upstream_ready) {
+    up.innerHTML = "<span class='dot ok'></span><span>上游已接通</span>";
+  } else if (S.cfg) {
+    up.innerHTML = "<span class='dot err'></span><span>上游未配置</span>";
+  }
+  var mode = document.getElementById("side-mode");
+  if (S.cfg) {
+    mode.innerHTML = S.cfg.dry_run
+      ? "<span class='dot warn'></span><span>DRY-RUN 试跑</span>"
+      : "<span class='dot ok'></span><span>正式发货</span>";
+  }
+}
+
+function renderAll() {
+  renderSide();
+  renderStats();
+  renderOverviewBanner();
+  renderOverviewLists();
+  renderAccounts();
+  renderRules();
+  renderReplies();
+  renderOrders();
+  renderCards();
+  renderMessages();
+  renderSettings();
+}
+
+/* ---------- 刷新 ---------- */
+var REFRESHING = false;
+async function refresh(manual) {
+  if (REFRESHING) return;
+  REFRESHING = true;
+  try {
+    var r = await Promise.all([
+      api("/api/accounts"), api("/api/status"), api("/api/rules"), api("/api/cards"),
+      api("/api/cards/stock"), api("/api/orders?limit=200"), api("/api/messages?limit=100"),
+      api("/api/config"), api("/api/reply-rules")
+    ]);
+    S.accounts = r[0]; S.status = r[1]; S.rules = r[2]; S.cards = r[3];
+    S.stock = r[4]; S.orders = r[5]; S.messages = r[6]; S.cfg = r[7];
+    S.replyRules = r[8];
+    renderAll();
+    var d = new Date();
+    document.getElementById("sync").textContent = "更新于 " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    if (manual) toast("已刷新");
+  } catch (e) {
+    document.getElementById("sync").textContent = "刷新失败";
+    if (manual) toast(e.message, true);
+  } finally {
+    REFRESHING = false;
+  }
+}
+
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  if (document.getElementById("rule-modal").classList.contains("open")) closeRule();
+  if (document.getElementById("reply-modal").classList.contains("open")) closeReply();
+});
+
+applyView();
+refresh();
+setInterval(function () { refresh(); }, 5000);
+</script>
+</body>
+</html>
