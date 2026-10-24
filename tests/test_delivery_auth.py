@@ -300,6 +300,46 @@ async def test_card_shaped_message_with_untrusted_order_id_needs_verification(db
     assert (await db.list_cards())[0]["status"] == "available"
 
 
+async def test_confirm_shipping_failure_after_send_keeps_card_sold(db):
+    """卡密已经发出去之后，确认发货失败不能退卡、也不能让这单重发。"""
+    import httpx
+
+    class TimeoutConfirm(FakeClient):
+        async def confirm_shipping(self, order_id):
+            raise httpx.ReadTimeout("confirm timed out")
+
+    rule = dict(CARD_RULE)
+    rule["auto_confirm"] = True
+    worker = await build(db, rule=rule)
+    worker.client = TimeoutConfirm()
+
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert worker.client.sent, "消息应该已经发出去了"
+    assert (await db.list_cards())[0]["status"] == "sold", "发出去的卡密不能再回库存"
+    orders = await db.list_orders()
+    assert orders[0]["status"] == "delivered"
+    assert "确认发货失败" in orders[0]["detail"]
+
+
+async def test_db_failure_after_send_keeps_card_sold(db, monkeypatch):
+    """发货记录写失败也不能退回卡密 —— 否则同一张卡会卖给下一个人。"""
+    rule = dict(CARD_RULE)
+    worker = await build(db, rule=rule)
+
+    async def boom(**fields):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(db, "record_order", boom)
+
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert worker.client.sent, "消息已经发出去了"
+    assert (await db.list_cards())[0]["status"] == "sold"
+    # 内存里去重也要打上，本进程不会再发一次
+    assert worker.engine._in_cooldown(1, ORDER)
+
+
 # ---------------------------------------------------------------- 去重
 
 

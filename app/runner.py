@@ -455,8 +455,11 @@ class AccountWorker:
         # 付款卡片），拉取路径可以等（保证同一会话的回复按顺序发出去）。
         reply_task = await self._maybe_auto_reply(msg) if allow_auto_reply else None
 
-        # 真人打的字要先去闲鱼核实订单（系统卡片不受影响）
-        if msg.order_id and not msg.is_system_card and is_paid_trigger(msg.content):
+        # 真人打的字要先去闲鱼核实订单。
+        # 只有「卡片形态 + 订单号来源可信」才免核实 —— 订单号如果是从正文里
+        # 捞出来的，那就跟买家自己打的一句话没有区别，必须核实。
+        trusted_card = msg.is_system_card and msg.order_id_trusted
+        if msg.order_id and not trusted_card and is_paid_trigger(msg.content):
             msg.order_verified = await self._verify_order_pending(msg.order_id, msg.sender_id)
 
         # 配置成固定文案 / 卡密池的规则在 decide 里就把文案渲染好了，
@@ -825,6 +828,7 @@ class AccountWorker:
             raw=data.get("raw") or {},
             message_id=str(data.get("message_id") or ""),
             is_system_card=custom_type not in (0, 1, 2),
+            order_id_trusted=bool(data.get("order_id_trusted")),
         )
 
     async def _order_poll_loop(self) -> None:
@@ -993,6 +997,8 @@ class AccountWorker:
             created_at=0,
             raw=order.get("raw") or {},
             amount_cny_hint=order.get("amount_cny_hint"),
+            # 订单号来自卖家「订单列表」接口，不是从聊天正文里捞的 —— 可信。
+            order_id_trusted=True,
         )
 
         decision = await self.engine.decide_order(self.account_id, msg)
@@ -1152,9 +1158,19 @@ class AccountWorker:
         return sent
 
     async def _release_leased_card(self, decision: Any) -> None:
-        """把决策阶段锁住的卡密放回库存（没锁卡就是空操作）。"""
+        """把决策阶段锁住的卡密放回库存（没锁卡就是空操作）。
+
+        **只要消息已经发出去了就不许退回**：卡在买家手里，退回库存等于
+        把同一张卡再卖一次；同一单的 delivered 记录也没写成，轮询还会重发。
+        """
         card_id = getattr(decision, "card_id", None)
         if card_id is None:
+            return
+        if getattr(decision, "sent", False):
+            logger.error(
+                "[%s] 卡密 %s 已经发给买家，后续步骤出错也不退回库存（请人工核对这单）",
+                self.name, card_id,
+            )
             return
         await self.db.release_card(card_id)
         logger.warning("[%s] 卡密 %s 未发出，已退回库存", self.name, card_id)
@@ -1206,28 +1222,58 @@ class AccountWorker:
             )
             return False
 
+        # ★ 不可逆点：消息已经到买家手上了。
+        #   从这里往后只允许「记账失败」，绝不允许把这一单当成「没发出去」——
+        #   否则会退卡（同一张卡卖给下一个人）+ 不落 delivered（轮询重发同一单）。
+        decision.sent = True
+
         confirm_note = ""
         if decision.auto_confirm and msg.order_id:
-            ok, detail = await self.client.confirm_shipping(msg.order_id)
-            confirm_note = ("确认发货成功：" if ok else "确认发货失败：") + detail
-            logger.info("[%s] 订单 %s %s", self.name, msg.order_id, confirm_note)
+            try:
+                ok, detail = await self.client.confirm_shipping(msg.order_id)
+                confirm_note = ("确认发货成功：" if ok else "确认发货失败：") + detail
+                logger.info("[%s] 订单 %s %s", self.name, msg.order_id, confirm_note)
+            except Exception as exc:  # 确认发货只是「加分项」，失败了也不能回滚发货
+                confirm_note = "确认发货失败：" + str(exc)
+                logger.warning("[%s] 订单 %s 确认发货异常（卡密已发出，不回滚）：%s",
+                               self.name, msg.order_id, exc)
 
-        await self.db.record_order(
-            account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
-            buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
-            card_id=decision.card_id, content=content, status="delivered",
-            detail=confirm_note, amount_cny=amount_cny, quota_usd=quota_usd,
-            card_code=card_code,
-        )
-        self.engine.mark_delivered(self.account_id, msg.order_id)
-        await self.db.log_message(
-            account_id=self.account_id, chat_id=msg.chat_id, sender_id=msg.sender_id,
-            sender_name=msg.sender_name, item_id=msg.item_id, order_id=msg.order_id,
-            content=content, kind="outgoing",
+        await self._record_delivered(
+            msg, decision, rule, content, confirm_note, amount_cny, quota_usd, card_code
         )
         logger.info("[%s] 已向 %s 发货（规则：%s，%s 元 → %s USD）",
                     self.name, msg.sender_name, rule.get("name"), amount_cny, quota_usd)
         return True
+
+    async def _record_delivered(self, msg: IncomingMessage, decision: Any, rule: dict[str, Any],
+                                content: str, confirm_note: str, amount_cny: float | None,
+                                quota_usd: float | None, card_code: str | None) -> None:
+        """发货之后的记账。
+
+        这几种失败只记日志、不往上抛：卡密已经发出去了，抛出去只会触发
+        「退回库存 / 重发」这两件更糟的事。内存里的 mark_delivered 照样打上，
+        所以本进程内也不会再把同一单发一遍。
+        """
+        self.engine.mark_delivered(self.account_id, msg.order_id)
+        try:
+            await self.db.record_order(
+                account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
+                buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
+                card_id=decision.card_id, content=content, status="delivered",
+                detail=confirm_note, amount_cny=amount_cny, quota_usd=quota_usd,
+                card_code=card_code,
+            )
+        except Exception:
+            logger.exception("[%s] 订单 %s 已发货，但写发货记录失败（不会重发，请手工补记录）",
+                             self.name, msg.order_id)
+        try:
+            await self.db.log_message(
+                account_id=self.account_id, chat_id=msg.chat_id, sender_id=msg.sender_id,
+                sender_name=msg.sender_name, item_id=msg.item_id, order_id=msg.order_id,
+                content=content, kind="outgoing",
+            )
+        except Exception:
+            logger.exception("[%s] 订单 %s 已发货，但写消息流水失败", self.name, msg.order_id)
 
     async def _provision(self, msg: IncomingMessage, rule: dict[str, Any]) -> tuple[str, float | None, float, str] | None:
         """上游模式的实际动作，返回 (卡密, 金额, 额度, 发货文案)；失败返回 None。"""

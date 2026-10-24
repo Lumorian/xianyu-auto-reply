@@ -32,6 +32,10 @@ class Decision:
     amount_cny: float | None = None
     quota_usd: float | None = None
     auto_confirm: bool = False
+    #: 发货消息是否**已经真的发到买家手上**。
+    #: 这是不可逆点：一旦为 True，后续任何失败都不许再把卡密退回库存
+    #: （否则同一张卡会卖给下一个人），也不许让这一单被重新发一次。
+    sent: bool = False
 
     @property
     def should_deliver(self) -> bool:
