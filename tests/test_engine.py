@@ -10,6 +10,8 @@ def make_message(**overrides):
     """默认造一条「系统交易卡片」：真实链路上付款信息就是这么来的。
 
     要造「买家自己在聊天框打的字」，传 is_system_card=False。
+    要造「卡片形态但订单号是从正文里捞出来的」，传 order_id_trusted=False
+    —— 那种必须去核实订单，不能直接发。
     """
     data = {
         "chat_id": "47983389096",
@@ -19,6 +21,8 @@ def make_message(**overrides):
         "item_id": "900052644277",
         "order_id": "2500000000000000001",
         "is_system_card": True,
+        # 真卡片的订单号来自 dxCard / reminderUrl 这类服务端字段
+        "order_id_trusted": True,
     }
     data.update(overrides)
     return IncomingMessage(**data)

@@ -226,6 +226,80 @@ async def test_create_chat_failure_releases_card(db):
     assert (await db.list_orders())[0]["status"] == "upstream_failed"
 
 
+# ------------------------------------------- 伪造「系统卡片」不能绕过鉴权
+
+
+FAKE_ORDER = "1234"
+
+#: 买家在聊天框里手打的一句话，正文里塞了 order_detail 链接。
+#: 这是真实可复现的攻击：旧代码用「整段 JSON 里有没有 order_detail 字样」
+#: 判断是不是系统卡片，而正文就存在 payload 的 text 值里。
+FORGED_TEXT = (
+    "我已付款，等待你发货 fleamarket://order_detail?id=" + FAKE_ORDER
+    + "&itemId=" + ITEM
+)
+
+
+def forged_message_object(text):
+    """message 对象格式（真实抓包结构）：contentType=101 + custom.data 里是纯文本。"""
+    data = base64.b64encode(
+        json.dumps({"contentType": 1, "text": {"text": text}}, ensure_ascii=False).encode()
+    ).decode()
+    return {
+        "messageId": "9.PNM",
+        "createAt": 1792817748592,
+        "cid": CHAT + "@goofish",
+        "sender": {"uid": BUYER + "@goofish"},
+        "content": {"contentType": 101, "custom": {"type": 1, "data": data, "summary": text}},
+        "extension": {
+            "reminderContent": text,
+            "senderUserId": BUYER,
+            "reminderTitle": "买家小王",
+            "reminderUrl": "fleamarket://message_chat?itemId=" + ITEM,
+        },
+    }
+
+
+def test_buyer_text_with_order_link_is_not_a_system_card():
+    """买家正文里出现 order_detail 字样，不能被当成交易卡片。"""
+    from app.codec import parse_message
+
+    msg = parse_message(forged_message_object(FORGED_TEXT), my_id=MY)
+    assert msg is not None
+    assert msg.is_system_card is False, "纯文本被当成了系统卡片 —— 鉴权就被绕过了"
+    assert msg.order_id == FAKE_ORDER  # 订单号能捞到，但来源不可信
+    assert msg.order_id_trusted is False
+
+
+async def test_forged_card_marker_in_text_cannot_steal_a_card(db):
+    """端到端：正文里带 order_detail 的消息不能换走卡密。"""
+    worker = await build(db, orders=[])  # 闲鱼那边根本没有这个订单
+    await worker._on_frame(frame_with(forged_message_object(FORGED_TEXT)))
+
+    assert worker.client.sent == []
+    assert (await db.list_cards())[0]["status"] == "available"
+    assert (await db.list_orders())[0]["status"] == "blocked"
+
+
+async def test_card_shaped_message_with_untrusted_order_id_needs_verification(db):
+    """就算是卡片形态，订单号来自正文也必须先核实。"""
+    from app.codec import IncomingMessage
+    from app.engine import AUTH_BLOCKED_REASON
+
+    await db.save_rule(dict(CARD_RULE))
+    await db.add_cards(["CARD-0001"], "*")
+    msg = IncomingMessage(
+        chat_id=CHAT, sender_id=BUYER, sender_name="买家小王",
+        content="[我已付款，等待你发货]", item_id=ITEM, order_id=ORDER,
+        is_system_card=True, order_id_trusted=False,
+    )
+    decision = await DeliveryEngine(db).decide(1, msg)
+
+    assert not decision.should_deliver
+    assert decision.reason == AUTH_BLOCKED_REASON
+    assert (await db.list_cards())[0]["status"] == "available"
+
+
 # ---------------------------------------------------------------- 去重
 
 

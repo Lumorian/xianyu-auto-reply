@@ -340,35 +340,70 @@ def extract_order_id(raw: dict[str, Any]) -> str | None:
 #: 其余（8 引导 / 14 系统提示 / 25 评价 / 26 交易卡片 / 36 卡片）都是系统消息。
 _HUMAN_CONTENT_TYPES = frozenset({1, 2})
 
-#: 卡片负载里一定会出现的标记。买家自己在聊天框打字造不出这些东西，
-#: 所以它们比 contentType 更可靠 —— 有些卡片推送里根本没带 "4"，
+#: 卡片负载里一定会出现的**键名**。买家在聊天框里只能写字，写不出「键」，
+#: 所以按键名判断是安全的 —— 有些卡片推送里根本没带 "4"，
 #: 只看 contentType 会把真卡片的 content_type 默认成 1（文本）。
-_CARD_MARKERS = ("dxcard", "order_detail", "trade_paid_done")
+#:
+#: ⚠️ 绝对不能改成「对整段 JSON 做子串匹配」：正文（买家可控）就存在
+#: payload 的 text 值里，扫值等于把「是不是交易卡片」这个信任判断交给买家。
+#: 曾经的写法把 order_detail 当标记扫全文，买家只要在聊天框里打一句
+#: 「我已付款，等待你发货 fleamarket://order_detail?id=1234」就能被当成
+#: 系统交易卡片，跳过订单核实直接领走卡密/Key。
+_CARD_KEYS = frozenset({"dxcard", "trade_paid_done", "ordercard", "ordercardinfo"})
+
+#: 交易卡片的消息类型（26 = 交易卡片，36 = 卡片消息）
+_CARD_CONTENT_TYPES = frozenset({26, 36})
 
 
 def _payload_is_card(payload: dict[str, Any] | None) -> bool:
-    """负载里是不是带了一张交易卡片（dxCard / 订单详情链接）。"""
+    """负载的**结构**里是不是带了一张交易卡片。
+
+    只看键名与 contentType，不看任何字符串值 —— 值里可能是买家打的字。
+    """
     if not isinstance(payload, dict) or not payload:
         return False
-    try:
-        blob = json.dumps(payload, ensure_ascii=False).lower()
-    except (TypeError, ValueError):  # pragma: no cover - 兜底
-        return False
-    return any(marker in blob for marker in _CARD_MARKERS)
+    stack: list[Any] = [payload]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for key, value in cur.items():
+                lowered = str(key).lower()
+                if lowered in _CARD_KEYS:
+                    return True
+                if lowered == "contenttype":
+                    try:
+                        if int(value) in _CARD_CONTENT_TYPES:
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return False
 
 
-def _is_card_type(content_type: int | None, payload: dict[str, Any] | None = None) -> bool:
+def _is_card_type(content_type: Any, payload: dict[str, Any] | None = None) -> bool:
     """这条消息是不是系统卡片（而不是买家真人打的字）。
 
     两个信号任一成立就算卡片：
-      1. 负载里带着 dxCard / order_detail 这类只有交易链路才产出的结构；
-      2. contentType 不是 1/2（文本、图片）。
+      1. 负载结构里带着 dxCard 这类只有交易链路才产出的**键**；
+      2. contentType 不是 1/2（文本、图片），或压根认不出来。
+
+    注意：这里只是「消息形态」判断，**不是信任判断**。
+    真正决定要不要跳过订单核实的是 (is_system_card and order_id_trusted)，
+    见 engine.decide。
     """
     if _payload_is_card(payload):
         return True
     if content_type is None:
         return False
-    return int(content_type) not in _HUMAN_CONTENT_TYPES
+    try:
+        return int(content_type) not in _HUMAN_CONTENT_TYPES
+    except (TypeError, ValueError):
+        # 认不出的类型（服务端给了非数字）：当卡片处理，避免把系统消息
+        # 当成买家真人文本去自动回复；是否可信仍由 order_id_trusted 决定。
+        return True
 
 
 def is_paid_trigger(content: str) -> bool:
@@ -402,6 +437,13 @@ class IncomingMessage:
     #: 服务端消息 id。推送和「拉会话列表」两条路会用同一个 id，
     #: 拿它去做跨路径去重，否则同一条消息会被处理两遍。
     message_id: str = ""
+    #: 订单号是不是来自**服务端结构化字段**（卡片 JSON / reminderUrl 参数 /
+    #: 会话 extension / 订单接口），而不是从正文里 grep 出来的。
+    #:
+    #: 这是鉴权的第二道闸：买家能控制正文，也就控制得了「正文里出现的订单号」。
+    #: 只有「卡片形态 + 订单号来源可信」两个条件同时成立，才允许跳过
+    #: 「去闲鱼核实订单」这一步（见 engine.decide）。
+    order_id_trusted: bool = False
     #: 订单号是否已经找闲鱼核实过「确实付了款、等我发货」。
     #: 真人文本消息必须核实过才允许发货（见 engine.decide）。
     order_verified: bool = False
@@ -483,8 +525,11 @@ def collect_texts(*nodes: Any) -> list[str]:
     return others[:3]
 
 
-def _flat_ids(raw: dict[str, Any]) -> tuple[str | None, str | None]:
-    """flat 负载里取 (item_id, order_id)：先解 custom，再全文兜底。"""
+def _flat_ids(raw: dict[str, Any]) -> tuple[str | None, str | None, bool]:
+    """flat 负载里取 (item_id, order_id, order_id_trusted)。
+
+    先解 custom（服务端结构），再全文兜底；只有前者出来的订单号算可信。
+    """
     content = _as_dict(_as_dict(raw.get("operation")).get("content"))
     inner = decode_custom(content)
     session_info = _as_dict(_as_dict(raw.get("operation")).get("sessionInfo"))
@@ -498,8 +543,16 @@ def _flat_ids(raw: dict[str, Any]) -> tuple[str | None, str | None]:
 
     if item_id is None:
         item_id = _search(_ITEM_ID_PATTERNS, texts)
-    order_id = _search(_ORDER_ID_PATTERNS, texts)
-    return item_id, order_id
+
+    order_id: str | None = None
+    order_trusted = False
+    if _payload_is_card(inner):
+        found = _search(_ORDER_ID_PATTERNS, _walk_strings(inner))
+        if found:
+            order_id, order_trusted = found, True
+    if order_id is None:
+        order_id = _search(_ORDER_ID_PATTERNS, texts)
+    return item_id, order_id, order_trusted
 
 
 def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
@@ -555,7 +608,7 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
     texts = collect_texts(inner, content)
     content_text = "\n".join(texts).strip()
 
-    item_id, order_id = _flat_ids(raw)
+    item_id, order_id, order_trusted = _flat_ids(raw)
 
     try:
         created_at = int(session_info.get("createTime") or raw.get("createTime") or 0)
@@ -577,6 +630,7 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         raw=raw,
         message_id=str(raw.get("messageId") or ""),
         is_system_card=_is_card_type(content_type, inner),
+        order_id_trusted=order_trusted,
     )
 
 
@@ -849,7 +903,21 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
     item_id = _search(_ITEM_ID_PATTERNS, _walk_strings(probes[0]))
     if item_id is None:
         item_id = _search(_ITEM_ID_PATTERNS, _walk_strings(probes[1:]))
-    order_id = _search(_ORDER_ID_PATTERNS, _walk_strings(probes))
+
+    # 订单号只认服务端结构：reminderUrl 的参数，或卡片形态的 inner（dxCard）。
+    # extension 和整条 obj 里带 reminderContent（买家正文），只能兜底、不可信。
+    order_id: str | None = None
+    order_trusted = False
+    if reminder_url:
+        found = _search(_ORDER_ID_PATTERNS, [reminder_url])
+        if found:
+            order_id, order_trusted = found, True
+    if order_id is None and _payload_is_card(inner):
+        found = _search(_ORDER_ID_PATTERNS, _walk_strings(inner))
+        if found:
+            order_id, order_trusted = found, True
+    if order_id is None:
+        order_id = _search(_ORDER_ID_PATTERNS, _walk_strings(probes))
 
     try:
         created_at = int(obj.get("createAt") or 0)
@@ -877,6 +945,7 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
         raw=obj,
         message_id=str(obj.get("messageId") or ""),
         is_system_card=_is_card_type(content_type, inner),
+        order_id_trusted=order_trusted,
     )
 
 
@@ -942,7 +1011,21 @@ def _parse_numbered(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         item_id = _search(_ITEM_ID_PATTERNS, [reminder_url])
     if item_id is None:
         item_id = _search(_ITEM_ID_PATTERNS, _walk_strings(probe))
-    order_id = _search(_ORDER_ID_PATTERNS, _walk_strings(probe))
+
+    # 可信来源只有两个：reminderUrl 的参数、卡片形态的 payload。
+    # msg_info / reminder 里带 reminderContent（买家正文），只能兜底、不可信。
+    order_id: str | None = None
+    order_trusted = False
+    if isinstance(reminder_url, str) and reminder_url:
+        found = _search(_ORDER_ID_PATTERNS, [reminder_url])
+        if found:
+            order_id, order_trusted = found, True
+    if order_id is None and block.payload and _payload_is_card(block.payload):
+        found = _search(_ORDER_ID_PATTERNS, _walk_strings(block.payload))
+        if found:
+            order_id, order_trusted = found, True
+    if order_id is None:
+        order_id = _search(_ORDER_ID_PATTERNS, _walk_strings(probe))
 
     if not content.strip() and not sender_id:
         # 既没正文也没有发送方 —— 大概率是控制包/回执的变体，不是买家消息
@@ -964,6 +1047,7 @@ def _parse_numbered(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         raw=raw,
         message_id=str(msg_info.get("3") or ""),
         is_system_card=_is_card_type(block.content_type, block.payload),
+        order_id_trusted=order_trusted,
     )
 
 

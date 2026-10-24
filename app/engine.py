@@ -152,12 +152,18 @@ class DeliveryEngine:
         # 只按文本判定等于把卡密池和上游 Key 交给任何人。
         #
         # 两条可信来源：
-        #   1. 系统交易卡片（contentType=26 + dxCard/order_detail，买家造不出来）；
+        #   1. 系统交易卡片，且订单号来自服务端结构化字段；
         #   2. 真人文本，但 runner 已经拿订单号去闲鱼核实过（msg.order_verified）。
         # 两种都要有订单号：没有订单号既不能去重，也不能核对归属。
+        #
+        # 为什么卡片还要再查一次 order_id_trusted：卡片形态（contentType=26 /
+        # dxCard 键）由服务端决定，但**订单号可能是从正文里 grep 出来的** ——
+        # 正文是买家写的。少了这一条，买家只要在消息里塞一个
+        # 「order_detail?id=随便编的数字」就能被判定成「卡片 + 有订单号」，
+        # 直接跳过核实领走卡密。
         if not msg.order_id:
             return Decision("skip", "缺少订单号，不自动发货")
-        if not msg.is_system_card and not msg.order_verified:
+        if not msg.order_verified and not (msg.is_system_card and msg.order_id_trusted):
             return Decision("skip", AUTH_BLOCKED_REASON)
 
         if await self.db.delivered_order_exists(account_id, msg.order_id):

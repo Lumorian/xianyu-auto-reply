@@ -863,7 +863,13 @@ class XianyuClient:
         from_me = bool(sender_id) and sender_id == self.user_id
         buyer_id = "" if from_me else (sender_id or (peer_id if peer_id != self.user_id else ""))
 
-        order_id = str(session_ext.get("orderId") or "") or _url_param(reminder_url, "orderId")
+        # 订单号的来源决定它可不可信：会话 extension / reminderUrl 是服务端字段，
+        # 正文（text）和 reminderContent 是买家写的，只能兜底。
+        order_id = str(session_ext.get("orderId") or "")
+        order_trusted = bool(order_id)
+        if not order_id:
+            order_id = _url_param(reminder_url, "orderId")
+            order_trusted = bool(order_id)
         if not order_id:
             order_id = _find_order_id(text) or _find_order_id(json.dumps(inner, ensure_ascii=False))
         if not order_id:
@@ -896,6 +902,7 @@ class XianyuClient:
             ),
             "content": text,
             "order_id": order_id or None,
+            "order_id_trusted": order_trusted,
             "created_at": created_at,
             "message_id": message_id,
             "from_me": from_me,
