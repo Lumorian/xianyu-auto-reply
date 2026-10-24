@@ -47,6 +47,29 @@ def make_cardshop(handler, **kwargs):
     return client
 
 
+async def test_create_token_rolls_back_when_key_cannot_be_read():
+    """令牌建出来了但取不到 Key：必须把它删掉，不能留个白吃额度的孤儿 Key。"""
+    seen: list[tuple[str, str]] = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={"success": True, "data": {"quota_per_unit": 500000}})
+        if request.url.path == "/api/token/" and request.method == "POST":
+            return httpx.Response(200, json={"success": True, "data": {"id": 42}})
+        if request.url.path == "/api/token/42/key":
+            return httpx.Response(200, json={"success": False, "message": "boom"})
+        if request.url.path == "/api/token/42" and request.method == "DELETE":
+            return httpx.Response(200, json={"success": True})
+        raise AssertionError(f"没预料到的请求 {request.method} {request.url.path}")
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    with pytest.raises(UpstreamError):
+        await client.create_token(10.0, "买家#123")
+
+    assert ("DELETE", "/api/token/42") in seen, f"没有回滚刚建的令牌：{seen}"
+
+
 async def test_create_token_flow():
     seen = []
 

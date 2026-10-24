@@ -370,12 +370,41 @@ class NewApiClient:
         payload_data = data.get("data")
         if isinstance(payload_data, dict) and payload_data.get("id"):
             token_id = str(payload_data["id"])
-        if not token_id:
-            token_id = await self._find_token_id(name)
-        key = await self._read_key(token_id)
+        try:
+            if not token_id:
+                token_id = await self._find_token_id(name)
+            key = await self._read_key(token_id)
+        except UpstreamError:
+            # 令牌已经建出来了：拿不到 Key 就别把它留在后台白吃额度
+            # （以前这里直接抛出去，后台会多一个没人知道、却还能用的 Key）
+            if token_id:
+                await self.delete_token_quietly(token_id)
+            raise
         logger.info("new-api 已建令牌 id=%s 名称=%s 额度=%s USD 模型限制=%s",
                     token_id, name, quota_usd, model_limits or "不限")
         return token_id, key
+
+    async def delete_token(self, token_id: str) -> bool:
+        """删除一个令牌（建卡密失败 / 取不到 Key 时回滚用）。
+
+        不在这里调 ensure_user_id：能走到这里说明刚才建令牌是成功的，
+        New-Api-User 头已经就位；而回滚路径上任何一个多余的往返都可能再失败一次。
+        """
+        await self.login()
+        client = await self._client()
+        resp = await client.delete(f"/api/token/{token_id}")
+        data = _json_of(resp, "new-api 删除令牌")
+        if not data.get("success"):
+            raise UpstreamError("new-api 删除令牌失败：" + str(data.get("message") or resp.status_code))
+        logger.info("new-api 已删除令牌 %s", token_id)
+        return True
+
+    async def delete_token_quietly(self, token_id: str) -> None:
+        """删令牌但只记日志：回滚失败不该盖住真正的错误。"""
+        try:
+            await self.delete_token(token_id)
+        except Exception as exc:
+            logger.error("回滚删除令牌 %s 失败：%s", token_id, exc)
 
     async def list_tokens(self, page_size: int = 100) -> list[dict[str, Any]]:
         """列出后台所有令牌（只读，供对账 / 维护脚本用）。"""
@@ -640,12 +669,8 @@ class Provisioner:
         return Provisioned(code, _mask(api_key), quota_usd, token_id)
 
     async def _revoke_token(self, token_id: str) -> None:
-        try:
-            client = await self.newapi._client()
-            await client.delete(f"/api/token/{token_id}")
-            logger.info("已删除回滚令牌 %s", token_id)
-        except Exception as exc:
-            logger.error("回滚删除令牌 %s 失败：%s", token_id, exc)
+        """卡密没建成时把刚建的令牌删掉（失败只记日志，不影响原本要抛的错）。"""
+        await self.newapi.delete_token_quietly(token_id)
 
 
 #: new-api 用 Go 的 len() 校验令牌名，单位是**字节**不是字符。
