@@ -419,8 +419,9 @@ new-api 的 `quota` 是按**站点展示货币**计价的，由后台 `quota_dis
 | --- | --- | --- |
 | `XY_DB_PATH` | `./data/app.db` | SQLite 文件位置 |
 | `XY_HOST` / `XY_PORT` | `127.0.0.1` / `8000` | 后台监听地址 |
-| `XY_ADMIN_TOKEN` | 空 | 管理口令。设置后所有 `/api` 需带 `X-Admin-Token`（或 `Authorization: Bearer`）；页面可用 `?token=xxx` |
-| `XY_ADMIN_ALLOW_REMOTE` | `0` | **没配口令时的兜底**：默认只允许本机访问管理接口；改成 `1` 才会对外网放行。**打开前必须先配 `XY_ADMIN_TOKEN`** —— 这个开关只是「放宽来源」，它不校验口令；两者都没配等于把后台交给任何人（启动时会打警告）。另外 uvicorn 已固定 `proxy_headers=False`，不会相信客户端自带的 `X-Forwarded-For` |
+| `XY_ADMIN_TOKEN` | 空 | 管理口令。设置后所有 `/api` 需带 `X-Admin-Token`（或 `Authorization: Bearer`）；页面用 `http://127.0.0.1:8000/#token=xxx` 打开（口令放在 `#` 后面不会发给服务器，也不会进访问日志；读完自动从地址栏抹掉） |
+| `XY_ADMIN_ALLOW_REMOTE` | `0` | **只在配了口令时才有意义**：放宽「哪些来源可以带口令访问」。没配口令时它**不生效**（否则等于「任何来源都不用口令」）—— 那种组合一律 401。uvicorn 已固定 `proxy_headers=False`，不会相信客户端自带的 `X-Forwarded-For` |
+| `XY_ALLOWED_HOSTS` | 空 | 额外允许的 Host（逗号分隔）。默认放行回环名字、`XY_HOST` 和任何纯 IP；**用域名访问必须把域名加到这里**，否则会被 Host 校验挡掉（那道校验是挡 DNS rebinding 的） |
 | `XY_DELIVERY_COOLDOWN` | `600` | 同一订单的重复发货冷却秒数 |
 | `XY_SEND_RETRY` | `2` | 发送失败重试次数 |
 | `XY_DRY_RUN` | `0` | 只打日志不真发（也不会真的建 Key） |
@@ -462,6 +463,19 @@ new-api 的 `quota` 是按**站点展示货币**计价的，由后台 `quota_dis
 > 卡密名称固定为 `买家用户名#订单号`（与令牌名一致，不带价格和平台前缀）。
 > 原先的 `XY_CARDSHOP_LABEL` 名称前缀已下线，配了也不会生效。
 
+### 管理后台的安全边界
+
+| 层 | 作用 | 说明 |
+| --- | --- | --- |
+| `XY_ADMIN_TOKEN` | 口令（恒定时间比较） | 错误 10 次/分钟 → 429；没配时只放行本机 |
+| 来源检查 | 没有口令时的兜底 | 只认 `127.0.0.1` / `::1` / `127.*` |
+| Host 校验 | 挡 DNS rebinding | 恶意域名解析到 127.0.0.1 时 Host 对不上 → 400；域名访问请配 `XY_ALLOWED_HOSTS` |
+| 跨站校验 | 挡 CSRF | 写请求要求同源（看 `Origin` / `Sec-Fetch-Site`），curl 之类不受影响 |
+| 响应头 | 降低注入与缓存泄漏 | `X-Frame-Options: DENY`、`Content-Security-Policy`、`/api` 一律 `no-store` |
+| 代理头 | 不让客户端伪造来源 | uvicorn 固定 `proxy_headers=False`，`X-Forwarded-For` 一律不采信 |
+
+> 没配口令 + `XY_ADMIN_ALLOW_REMOTE=1` **不再**等于「对所有人开放」：这一条现在会被忽略，
+> 远程请求一律 401。要远程用就配口令 —— 只放宽来源、不放宽口令，才是安全的那一半。
 ## 代码结构
 
 ```
@@ -481,7 +495,7 @@ app/web.py         FastAPI 管理接口 + 内嵌 HTML 后台
 app/daemon.py      进程控制：pid 文件、单实例锁、SIGTERM/SIGKILL、端口等待
 start.sh           唯一入口：自动建 venv / 装依赖，再转给 ctl.py
 ctl.py             启停子命令实现（一般不用直接调）
-tests/             369 个单元 / 集成测试，全部离线运行
+tests/             378 个单元 / 集成测试，全部离线运行
 ```
 
 ## 测试
