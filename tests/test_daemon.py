@@ -8,14 +8,20 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+
+import pytest
 
 from app.daemon import (
+    ControlError,
     Health,
+    ProcessController,
     ProcessInfo,
     decide_health,
     decide_stop,
     is_pid_alive,
     looks_like_ours,
+    port_in_use,
     wait_until,
 )
 
@@ -149,6 +155,52 @@ def test_is_pid_alive_for_bogus_pid():
 
 def test_wait_until_returns_immediately_when_true():
     assert wait_until(lambda: True, timeout=1.0) is True
+
+
+# ------------------------------------------------- 端口探测 / 启动互斥
+
+
+def _controller(tmp_path) -> ProcessController:
+    return ProcessController(
+        tmp_path / "app.pid", cwd=tmp_path, host="127.0.0.1", port=1,
+    )
+
+
+def test_port_in_use_detects_ipv6_listener():
+    """XY_HOST=::1 / :: 时必须用 AF_INET6 探测，否则会把「在跑」判成「没在跑」。"""
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError:
+        pytest.skip("系统没开 IPv6")
+    with sock:
+        try:
+            sock.bind(("::1", 0))
+            sock.listen(1)
+        except OSError:
+            pytest.skip("::1 不可用")
+        port = sock.getsockname()[1]
+        assert port_in_use("::1", port) is True
+        assert port_in_use("::", port) is True
+
+
+def test_port_in_use_false_for_closed_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    # 已经关闭，应该探测不到
+    assert port_in_use("127.0.0.1", port) is False
+
+
+def test_run_lock_is_exclusive(tmp_path):
+    """两个 start 同时判断「没在跑」→ 必须只有一个能进临界区。"""
+    ctl = _controller(tmp_path)
+    with ctl.run_lock():
+        with pytest.raises(ControlError):
+            with ctl.run_lock():
+                pass
+    # 释放之后还能再拿（第二次启动不会永远卡住）
+    with ctl.run_lock():
+        pass
 
 
 def test_wait_until_times_out():

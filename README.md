@@ -318,7 +318,10 @@ SELECT created_at, order_id, status, detail FROM orders WHERE status != 'deliver
   `custom.type != 1` 的消息只记录、不自动回复，避免对着系统提示说「在的」；
 - **自动回复是后台任务** —— 带 `XY_AUTO_REPLY_DELAY` 的延迟不会卡住收帧循环，
   紧接着的付款卡片照样立刻处理；
-- **发送失败不记入去重** —— 没发出去就不算「回过」，下次买家再问还会回。
+- **发送失败不记入去重** —— 没发出去就不算「回过」，下次买家再问还会回；
+- **处理途中出错会重试** —— 消息是「先标记已处理再干活」的（否则推送和拉取会各回一遍），
+  所以一旦下游抛异常，程序会**撤销那个标记**，下一轮重新处理；同一条连续失败 3 次后放弃，
+  免得一条坏消息把日志刷满。
 
 接口（和页面对应，方便脚本化）：
 
@@ -432,6 +435,7 @@ new-api 的 `quota` 是按**站点展示货币**计价的，由后台 `quota_dis
 | `XY_MESSAGE_POLL_LIMIT` | `20` | 每次拉多少个会话（最多 50） |
 | `XY_MESSAGE_HISTORY_LIMIT` | `20` | 发现新消息时往回补拉多少条历史（最多 50） |
 | `XY_MESSAGE_HISTORY_CONVERSATIONS` | `5` | 每轮最多给几个会话补拉历史；0 = 只看最后一条 |
+| `XY_MESSAGE_RETENTION_DAYS` | `30` | 消息流水保留天数；0 = 永久保留。**只清 `messages`** —— `seen_messages` / `reply_hits` 清了会让「同一会话只回一次」和去重失效，宁可留着 |
 | `XY_SYNC_POLL_INTERVAL` | `30` | ackDiff 同步位点重发间隔（秒），0 = 只发一次（不推荐） |
 | `XY_HEARTBEAT_INTERVAL` | `10` | WebSocket 心跳间隔（秒）。首跳立即发，必须在注册之前 |
 | `XY_REGISTER_GAP` | `1` | `/reg` 与 ackDiff 之间的间隔（秒），太小会导致注册不生效 |
@@ -477,7 +481,7 @@ app/web.py         FastAPI 管理接口 + 内嵌 HTML 后台
 app/daemon.py      进程控制：pid 文件、单实例锁、SIGTERM/SIGKILL、端口等待
 start.sh           唯一入口：自动建 venv / 装依赖，再转给 ctl.py
 ctl.py             启停子命令实现（一般不用直接调）
-tests/             356 个单元 / 集成测试，全部离线运行
+tests/             369 个单元 / 集成测试，全部离线运行
 ```
 
 ## 测试

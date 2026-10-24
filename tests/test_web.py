@@ -224,6 +224,31 @@ async def test_emptying_model_limits_is_allowed_and_flagged(client):
     assert cfg["newapi"]["model_limits_unlimited"] is True
 
 
+async def test_site_currency_is_cached_between_refreshes(client, monkeypatch):
+    """前端每 5 秒拉一次 /api/config，不能每次都去问 new-api 的 /api/status。"""
+    import app.web as web_mod
+    from app.upstream import QuotaModel
+
+    web_mod._SITE_CURRENCY_CACHE.clear()
+    calls = {"n": 0}
+
+    async def fake_site_quota_model(self):
+        calls["n"] += 1
+        return QuotaModel(quota_per_unit=500000.0, currency="CNY", usd_exchange_rate=7.3,
+                          exchange_rate=7.3)
+
+    monkeypatch.setattr("app.upstream.NewApiClient.site_quota_model", fake_site_quota_model)
+
+    first = (await client.get("/api/config")).json()
+    await client.get("/api/config")
+    assert first["newapi"]["currency"] == "CNY"
+    assert calls["n"] == 1, "60 秒内必须命中缓存"
+
+    web_mod._SITE_CURRENCY_CACHE.clear()  # 模拟 TTL 到期
+    await client.get("/api/config")
+    assert calls["n"] == 2
+
+
 async def test_saving_model_limits_updates_the_running_provisioner(tmp_path):
     """后台保存后必须同步给**运行中**的上游客户端，否则「保存即生效」是假的。
 

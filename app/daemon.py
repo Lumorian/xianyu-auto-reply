@@ -37,10 +37,16 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:  # Windows 没有 fcntl：退化成「不加锁」，其余逻辑照旧
+    import fcntl
+except ImportError:  # pragma: no cover - 非 POSIX 平台
+    fcntl = None  # type: ignore[assignment]
 
 #: 正常停止时给 uvicorn 的收尾时间（秒）。它退出时要关闭长连接、等 DB 落盘。
 STOP_TIMEOUT = 15.0
@@ -196,11 +202,24 @@ def decide_stop(health: Health, *, force: bool = False) -> tuple[str, str]:
 
 
 def port_in_use(host: str, port: int) -> bool:
-    """端口上有没有人在监听。"""
-    # 0.0.0.0 / :: 是「监听所有网卡」的写法，探测时得换成回环地址
-    wildcard = host in ("", "0.0.0.0", "::")  # noqa: S104 - 只是判断用户是不是填了通配地址，并不真的绑定
-    probe = "127.0.0.1" if wildcard else host
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    """端口上有没有人在监听。
+
+    注意地址族：XY_HOST=::1 / :: 时必须用 AF_INET6 去探测，否则 connect_ex
+    永远返回「连不上」—— 那样「已经在跑」会判成「没在跑」，起出第二个实例。
+    """
+    # 0.0.0.0 / :: 是「监听所有网卡」的写法，探测时得换成对应族的回环地址
+    if host in ("", "0.0.0.0"):  # noqa: S104 - 只是判断用户是不是填了通配地址，并不真的绑定
+        probe = "127.0.0.1"
+    elif host == "::":
+        probe = "::1"
+    else:
+        probe = host
+    family = socket.AF_INET6 if ":" in probe else socket.AF_INET
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:  # 系统没开 IPv6
+        return False
+    with sock:
         sock.settimeout(0.3)
         try:
             return sock.connect_ex((probe, port)) == 0
@@ -248,6 +267,35 @@ class ProcessController:
         self.log_file = Path(log_file) if log_file else None
         self.stop_timeout = stop_timeout
 
+    @property
+    def lock_file(self) -> Path:
+        return self.pid_file.with_suffix(".lock")
+
+    @contextmanager
+    def run_lock(self) -> Iterator[None]:
+        """给「启动 / 停止」加互斥锁（跨进程）。
+
+        只靠 pid 文件判断「有没有在跑」是典型的 TOCTOU：两个 start 同时看到
+        「没有 pid 文件」就会都去 Popen。后一个因端口占用退出时还会
+        clear_stale_pid()，把前一个**正在运行**的实例的 pid 文件删掉 ——
+        之后 status/stop 都不认它，下一次 start 又能起第三个实例。
+        """
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.lock_file, "a+") as handle:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise ControlError("另一个 start/stop 正在执行，请稍后再试") from exc
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+
     # ---------------------------------------------------------- 查询
 
     def inspect(self) -> Health:
@@ -283,6 +331,11 @@ class ProcessController:
     # ---------------------------------------------------------- 启动
 
     def start(self, *, timeout: float = 20.0) -> ProcessInfo:
+        """后台启动一个实例（带跨进程锁）。"""
+        with self.run_lock():
+            return self._start_locked(timeout=timeout)
+
+    def _start_locked(self, *, timeout: float = 20.0) -> ProcessInfo:
         """后台启动一个实例，等它真正能响应再返回。
 
         这里**不做 double-fork**：直接 Popen 之后放进新会话（start_new_session），
@@ -336,8 +389,9 @@ class ProcessController:
                 "启动后进程立刻退出了，最近的日志：\n" + self.tail_log(15)
             )
         if not ok:
-            # 进程还活着但端口一直没起来，别留个半死不活的在后面
-            self.stop(force=True)
+            # 进程还活着但端口一直没起来，别留个半死不活的在后面。
+            # 这里必须调不带锁的版本：锁已经握在 start 手里了。
+            self._stop_locked(force=True)
             raise ControlError(f"启动超时：{timeout:g} 秒内端口 {self.port} 没有开始监听")
 
         return ProcessInfo(
@@ -365,6 +419,11 @@ class ProcessController:
     # ---------------------------------------------------------- 停止
 
     def stop(self, *, force: bool = False, timeout: float | None = None) -> str:
+        """停掉实例（带跨进程锁）。"""
+        with self.run_lock():
+            return self._stop_locked(force=force, timeout=timeout)
+
+    def _stop_locked(self, *, force: bool = False, timeout: float | None = None) -> str:
         """停掉实例。返回一句给用户看的结果。
 
         流程：SIGTERM → 等进程消失 → （必要时）SIGKILL → 等端口释放 → 删 pid 文件。

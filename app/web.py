@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,6 +25,11 @@ from .upstream import normalize_model_limits
 logger = logging.getLogger(__name__)
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+#: 站点货币的进程内缓存：base_url -> (取回时刻, 货币)。
+#: 前端每 5 秒拉一次 /api/config，不能每次都去问上游。
+_SITE_CURRENCY_CACHE: dict[str, tuple[float, str]] = {}
+_SITE_CURRENCY_TTL = 60.0
 
 
 class AccountIn(BaseModel):
@@ -88,6 +95,24 @@ class CardsIn(BaseModel):
     raw_text: str = ""
 
 
+async def _prune_loop(db: Database, interval: float = 3600.0) -> None:
+    """每小时清一次过期消息流水（XY_MESSAGE_RETENTION_DAYS，0 = 不清）。
+
+    先睡再干：启动那一刻没必要就去扫库，也避免「刚起进程就被取消」
+    把 aiosqlite 的工作线程挂在已关闭的事件循环上。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        days = settings.message_retention_days
+        if days > 0:
+            try:
+                deleted = await db.prune_history(days)
+                if deleted:
+                    logger.info("已清理 %s 天前的消息流水：%s 条", days, deleted)
+            except Exception as exc:  # 清理失败不该影响收发货
+                logger.warning("清理消息流水失败：%s", exc)
+
+
 def create_app(db: Database | None = None, manager: WorkerManager | None = None) -> FastAPI:
     database = db or Database(settings.db_path)
 
@@ -97,9 +122,15 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         mgr = manager or WorkerManager(database)
         app.state.manager = mgr
         await mgr.sync()
+        prune_task = asyncio.create_task(_prune_loop(database), name="message-prune")
         try:
             yield
         finally:
+            prune_task.cancel()
+            try:
+                await prune_task
+            except (asyncio.CancelledError, Exception):  # noqa: S110 - 退出流程里不重要
+                pass
             await mgr.stop_all()
             await app.state.qr.close()
 
@@ -422,7 +453,15 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         }
 
     async def _site_currency() -> str:
-        """站点展示货币（USD / CNY / CUSTOM）。读不到就当 USD，保持老行为。"""
+        """站点展示货币（USD / CNY / CUSTOM）。读不到就当 USD，保持老行为。
+
+        结果缓存 60 秒：前端每 5 秒刷新一次，而每次刷新都打一遍 new-api 的
+        /api/status 既浪费又把页面拖慢（上游慢的时候单个请求能等 10 秒）。
+        """
+        key = settings.newapi_base_url or "-"
+        cached = _SITE_CURRENCY_CACHE.get(key)
+        if cached is not None and time.monotonic() - cached[0] < _SITE_CURRENCY_TTL:
+            return cached[1]
         try:
             from .upstream import NewApiClient
 
@@ -435,13 +474,15 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             )
             try:
                 model = await client.site_quota_model()
-                return model.currency
+                currency = model.currency
             finally:
                 await client.close()
         except Exception:
             # 纯展示用：取不到不该让整个 /api/config 失败
             logger.debug("读取站点货币失败，按 USD 展示", exc_info=True)
-            return "USD"
+            currency = "USD"
+        _SITE_CURRENCY_CACHE[key] = (time.monotonic(), currency)
+        return currency
 
     @app.get("/api/config/settings", dependencies=guard)
     async def show_settings() -> dict[str, Any]:
