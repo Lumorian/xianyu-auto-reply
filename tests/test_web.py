@@ -224,6 +224,31 @@ async def test_emptying_model_limits_is_allowed_and_flagged(client):
     assert cfg["newapi"]["model_limits_unlimited"] is True
 
 
+async def test_saving_model_limits_updates_the_running_provisioner(tmp_path):
+    """后台保存后必须同步给**运行中**的上游客户端，否则「保存即生效」是假的。
+
+    Provisioner 是进程启动时按当时的配置构造的；只写 app_config 不改它，
+    得重启才生效 —— 运营以为收紧了模型白名单，实际每单还在建不限模型的 Key。
+    """
+    from types import SimpleNamespace
+
+    db = Database(tmp_path / "hot.db")
+    manager = StubManager(db)
+    manager.provisioner = SimpleNamespace(
+        newapi=SimpleNamespace(model_limits="deepseek-old"),
+    )
+    app = create_app(db=db, manager=manager)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with app.router.lifespan_context(app):
+            res = await ac.put(
+                "/api/config/settings", json={"model_limits": "deepseek-v4.1-flash, deepseek-v4.1"}
+            )
+            assert res.status_code == 200
+
+    assert manager.provisioner.newapi.model_limits == "deepseek-v4.1-flash,deepseek-v4.1"
+
+
 async def test_settings_endpoints_require_admin_token(client, monkeypatch):
     """设置能放宽 Key 的限制，必须和别的管理接口一样受口令保护。"""
     from app.config import settings

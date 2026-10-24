@@ -236,8 +236,11 @@ class QrLoginManager:
         )
         try:
             data = resp.json()["content"]["data"]
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             raise LoginError(f"生成二维码失败（HTTP {resp.status_code}）：{resp.text[:200]}") from exc
+        if not isinstance(data, dict):
+            # data 为 null / 字符串时再往下 .get 就是 AttributeError → 500
+            raise LoginError(f"生成二维码失败（HTTP {resp.status_code}）：返回结构异常")
 
         qr_url = data.get("codeContent") or ""
         if not qr_url:
@@ -294,8 +297,11 @@ class QrLoginManager:
                 },
             )
             payload = resp.json()["content"]["data"]
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             logger.debug("查询扫码状态失败：%s", exc)
+            return session
+        if not isinstance(payload, dict):
+            logger.debug("查询扫码状态返回结构异常：%r", payload)
             return session
 
         status = str(payload.get("qrCodeStatus") or "NEW")

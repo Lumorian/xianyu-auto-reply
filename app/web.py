@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -138,8 +138,10 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
 
         expected = settings.admin_token
         if expected:
-            # 恒定时间比较：普通 != 会按「第几个字符不同」泄漏时间差
-            if not hmac.compare_digest(token, expected):
+            # 恒定时间比较：普通 != 会按「第几个字符不同」泄漏时间差。
+            # 必须比 bytes —— compare_digest 不接受含非 ASCII 字符的 str，
+            # 口令里带中文会直接 TypeError，变成每个请求都 500。
+            if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
                 raise HTTPException(status_code=401, detail="管理口令错误")
             return
 
@@ -393,11 +395,11 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     # -------------------------------------------------------------- 记录
 
     @app.get("/api/orders", dependencies=guard)
-    async def list_orders(limit: int = 100) -> list[dict[str, Any]]:
+    async def list_orders(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
         return await database.list_orders(limit)
 
     @app.get("/api/messages", dependencies=guard)
-    async def list_messages(limit: int = 100) -> list[dict[str, Any]]:
+    async def list_messages(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
         return await database.list_messages(limit)
 
     # -------------------------------------------------------------- 设置
@@ -447,7 +449,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         return {"model_limits": await _model_limits_state()}
 
     @app.put("/api/config/settings", dependencies=guard)
-    async def save_settings(payload: SettingsIn) -> dict[str, Any]:
+    async def save_settings(payload: SettingsIn, request: Request) -> dict[str, Any]:
         """保存模型白名单。保存后立刻对新订单生效，不用重启、不用改 .env。
 
         已经发出去的旧 Key 不受影响 —— 它们是建令牌时写进 new-api 的，
@@ -455,10 +457,16 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         """
         normalized = normalize_model_limits(payload.model_limits)
         await database.set_config(MODEL_LIMITS_KEY, normalized)
+        # 光写库 ≠ 生效：Provisioner 是在进程启动时按当时的配置构造的，
+        # 不回推给存活的对象，后台「保存即生效」就是假的（得重启才生效）。
+        provisioner = getattr(getattr(request.app.state, "manager", None), "provisioner", None)
+        live_newapi = getattr(provisioner, "newapi", None)
+        if live_newapi is not None:
+            live_newapi.model_limits = normalized
         if not normalized:
             logger.warning("后台把模型白名单清空了：之后新建的 Key 将不限制模型")
         else:
-            logger.info("后台更新模型白名单：%s", normalized)
+            logger.info("后台更新模型白名单：%s（已同步到运行中的上游客户端）", normalized)
         return {"ok": True, "model_limits": await _model_limits_state()}
 
     @app.get("/api/config", dependencies=guard)

@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 #: 从「¥1,099.00」这类展示串里剥出纯数字。注意：
 #:   1) 先把负号记下来再剥，否则 "-5" 会被剥成 "5"；
@@ -81,7 +84,17 @@ def parse_amount(value: object, unit: str = "auto") -> Amount | None:
         return None
 
     mode = (unit or "auto").lower()
-    if mode == "fen" or (mode == "auto" and is_int and numeric >= 1000):
+    # 「整数且 >= 1000 就当成分」只是猜：真遇到一笔 1000 元的订单时，
+    # 这里会把 ¥1000 算成 ¥10，额度少发 100 倍。猜中猜错都留一条日志，
+    # 让「金额看着不对」时有据可查；能确定单位就设 XY_ORDER_AMOUNT_UNIT。
+    guessed_fen = mode == "auto" and is_int and numeric >= 1000
+    if guessed_fen:
+        logger.warning(
+            "订单金额 %s 被当成「分」处理，换算结果 %s 元；"
+            "如果这其实是元，请把 XY_ORDER_AMOUNT_UNIT 设成 yuan",
+            text, round(numeric / 100, 2),
+        )
+    if mode == "fen" or guessed_fen:
         return Amount(cny=round(numeric / 100, 2), source=text)
     return Amount(cny=round(numeric, 2), source=text)
 

@@ -60,6 +60,24 @@ def setup_logging(*, console: bool = True) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def uvicorn_run_kwargs() -> dict[str, object]:
+    """uvicorn.run 的参数。
+
+    单独拎出来是为了能被测试盯住：proxy_headers 一旦回到默认的 True，
+    「没配口令只允许本机」这道闸就能被一个 X-Forwarded-For 头绕过。
+    """
+    return {
+        "host": settings.host,
+        "port": settings.port,
+        "log_level": settings.log_level.lower(),
+        "log_config": None,  # 让 uvicorn 用我们配好的 root logger，别自己再建一套
+        # 不能相信 X-Forwarded-For：默认 True 时，只要前面挂一台同机反代，
+        # 客户端自己发一个 X-Forwarded-For: 127.0.0.1 就会被当成「本机访问」。
+        # 管理接口的鉴权不能建立在一个客户端可写的请求头上面。
+        "proxy_headers": False,
+    }
+
+
 def main() -> None:
     # ./start.sh 会把这个置为 1：它的 stdout 已经指向日志文件了
     background = os.getenv("XY_BACKGROUND") == "1"
@@ -74,13 +92,14 @@ def main() -> None:
             settings.log_max_bytes // 1024 // 1024,
             settings.log_backup_count,
         )
-    uvicorn.run(
-        create_app(),
-        host=settings.host,
-        port=settings.port,
-        log_level=settings.log_level.lower(),
-        log_config=None,  # 让 uvicorn 用我们配好的 root logger，别自己再建一套
-    )
+    if settings.admin_allow_remote and not settings.admin_token:
+        # 这条组合等于「任何来源都不用口令就能管后台」：只放宽来源、不放宽口令才安全
+        logger.warning(
+            "XY_ADMIN_ALLOW_REMOTE=1 但没配 XY_ADMIN_TOKEN：管理接口对任何来源都不校验口令。"
+            "请设置 XY_ADMIN_TOKEN，或把 XY_ADMIN_ALLOW_REMOTE 改回 0。"
+        )
+
+    uvicorn.run(create_app(), **uvicorn_run_kwargs())  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

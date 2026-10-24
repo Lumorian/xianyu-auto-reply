@@ -102,9 +102,9 @@ class Settings:
     newapi_model_limits: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_MODEL_LIMITS", DEFAULT_MODEL_LIMITS))
     # 多少元人民币换 1 美元额度。默认 1 = 订单 10 元发 10 美元额度（1:1，有意为之的让利）。
     # 想按真实汇率收窄就设成 7.3 之类的数字。
-    cny_per_usd: float = field(default_factory=lambda: float(os.getenv("XY_CNY_PER_USD", "1") or 1))
+    cny_per_usd: float = field(default_factory=lambda: _float("XY_CNY_PER_USD", 1.0))
     # quota_per_unit 兜底值，正常会从 /api/status 读到真实值
-    newapi_quota_per_unit: float = field(default_factory=lambda: float(os.getenv("XY_NEWAPI_QUOTA_PER_UNIT", "0") or 0))
+    newapi_quota_per_unit: float = field(default_factory=lambda: _float("XY_NEWAPI_QUOTA_PER_UNIT", 0.0))
     # new-api 0.13.x 必填：所有后台接口都要带 New-Api-User（用户 id）。留空会在登录后自动探测。
     newapi_user_id: str = field(default_factory=lambda: os.getenv("XY_NEWAPI_USER_ID", ""))
 
@@ -160,7 +160,7 @@ class Settings:
     # 订单金额单位：auto 会按数值大小猜（整数且很大时视为「分」），也可强制 yuan / fen
     order_amount_unit: str = field(default_factory=lambda: os.getenv("XY_ORDER_AMOUNT_UNIT", "auto"))
     # 单笔订单允许的最大金额（元），超过则不自动发货，防止标错价被刷
-    max_order_cny: float = field(default_factory=lambda: float(os.getenv("XY_MAX_ORDER_CNY", "0") or 0))
+    max_order_cny: float = field(default_factory=lambda: _float("XY_MAX_ORDER_CNY", 0.0))
 
     # ---- 登录态保活（参考 xianyu-pilot）----
     # accessToken 进程内缓存时长（秒）。0 = 不缓存。缓存能显著减少重连时的

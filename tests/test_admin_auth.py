@@ -107,6 +107,26 @@ async def test_qrcode_endpoint_also_requires_token(tmp_path, monkeypatch):
     assert res.status_code == 401
 
 
+async def test_non_ascii_admin_token_still_answers_401(tmp_path, monkeypatch):
+    """口令里带中文时不能 500：hmac.compare_digest 不接受非 ASCII 的 str。
+
+    以前这里会 TypeError —— 于是任何一个请求都变成 500（配了中文口令直接锁死后台）。
+    """
+    app, _ = make_app(tmp_path, monkeypatch, token="中文口令")
+    res = await call(app, "127.0.0.1", "GET", "/api/orders",
+                     headers={"X-Admin-Token": "wrong"})
+    assert res.status_code == 401
+    assert res.json()["detail"] == "管理口令错误"
+
+
+def test_uvicorn_does_not_trust_forwarded_headers():
+    """uvicorn 默认 proxy_headers=True 会让 X-Forwarded-For 冒充本机访问。"""
+    from main import uvicorn_run_kwargs
+
+    kwargs = uvicorn_run_kwargs()
+    assert kwargs["proxy_headers"] is False
+
+
 async def test_internal_error_does_not_leak_details(tmp_path, monkeypatch):
     """500 不能把内部异常原文回给前端。"""
     app, _ = make_app(tmp_path, monkeypatch)

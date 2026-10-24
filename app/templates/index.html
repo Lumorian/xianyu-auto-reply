@@ -779,13 +779,26 @@ function applyView() {
 window.addEventListener("hashchange", applyView);
 
 /* ---------- 扫码登录 ---------- */
+/* 二维码图片必须走 fetch 带 X-Admin-Token：
+   <img src> 发不了自定义请求头，配了 XY_ADMIN_TOKEN 之后那个地址只会 401，
+   扫码登录就永远是空白图。这里取回二进制再转成 blob URL 塞给 <img>。 */
+async function loadQrImage(sid) {
+  var res = await fetch("/api/login/" + sid + "/qrcode?t=" + Date.now(), { headers: headers() });
+  if (!res.ok) throw new Error(await explainError(res));
+  var blob = await res.blob();
+  var img = document.getElementById("qr-img");
+  if (img.dataset.blobUrl) URL.revokeObjectURL(img.dataset.blobUrl);
+  var url = URL.createObjectURL(blob);
+  img.dataset.blobUrl = url;
+  img.src = url;
+}
 async function startQr() {
   var name = document.getElementById("login-name").value.trim() || "闲鱼账号";
   try {
     var r = await api("/api/login/start", { method: "POST", body: JSON.stringify({ name: name, remark: "" }) });
     QR_SID = r.session_id;
     document.getElementById("qr-area").style.display = "flex";
-    document.getElementById("qr-img").src = "/api/login/" + r.session_id + "/qrcode?t=" + Date.now();
+    await loadQrImage(r.session_id);
     document.getElementById("qr-title").textContent = "等待扫码";
     document.getElementById("qr-status").className = "muted";
     document.getElementById("qr-status").textContent = "用手机闲鱼 App 扫左边的二维码";
