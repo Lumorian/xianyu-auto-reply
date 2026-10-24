@@ -137,6 +137,11 @@ class Settings:
     message_history_conversations: int = field(
         default_factory=lambda: _int("XY_MESSAGE_HISTORY_CONVERSATIONS", 5)
     )
+    # 消息流水保留天数，0 = 永久保留。只清 messages 表：seen_messages / reply_hits
+    # 删了会让「同一会话只回一次」失效（详见 Database.prune_history）。
+    message_retention_days: int = field(
+        default_factory=lambda: _int("XY_MESSAGE_RETENTION_DAYS", 30)
+    )
 
     # 自动回复总开关。关掉后商品 / 关键词自动回复全部不生效（只发货）。
     auto_reply_enabled: bool = field(default_factory=lambda: _bool("XY_AUTO_REPLY", True))

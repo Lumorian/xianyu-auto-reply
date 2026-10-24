@@ -519,33 +519,77 @@ class Database:
         """记录一次发货。
 
         同一 (账号, 订单号) 只保留一行：重试时覆盖上一次的失败记录，
-        这样"哪个订单还没发出去"永远用一条 SQL 就能查干净。
+        这样「哪个订单还没发出去」永远用一条 SQL 就能查干净。
+
+        「查 + 写」必须在同一个写事务里（BEGIN IMMEDIATE）。旧写法是先 SELECT
+        再 INSERT/UPDATE：推送和轮询同时处理同一单时，两边都查不到就都 INSERT，
+        后一个直接撞唯一索引抛 IntegrityError —— 而那一步在发货之后，
+        会被上层当成「没发出去」（退卡 + 重发）。
+
+        另外，原来那条 blocked（有人在拿别人的订单号试发货）被后来的 delivered
+        覆盖时，会把原因并进 detail，审计信息不会凭空消失。
         """
         fields.setdefault("created_at", now_iso())
+        names = self._checked_columns(fields, self._ORDER_COLUMNS)
         account_id = fields.get("account_id")
         order_id = fields.get("order_id")
 
-        if order_id:
-            existing = await self.fetch_one(
-                "SELECT id FROM orders WHERE account_id = ? AND order_id = ?", (account_id, order_id)
+        if not order_id:
+            # 没有订单号的行不参与 idx_orders_dedup（它的 WHERE 是 order_id IS NOT NULL），
+            # 直接插入；也就不存在并发覆盖的问题。
+            columns = ", ".join(names)
+            placeholders = ", ".join("?" for _ in names)
+            return await self.execute(
+                f"INSERT INTO orders ({columns}) VALUES ({placeholders})",  # noqa: S608 - 列名已过白名单
+                tuple(fields.values()),
             )
-            if existing:
-                names = self._checked_columns(fields, self._ORDER_COLUMNS)
-                assignments = ", ".join(f"{key} = ?" for key in names if key != "account_id")
-                values = tuple(value for key, value in fields.items() if key != "account_id")
-                await self.execute(
-                    f"UPDATE orders SET {assignments} WHERE id = ?",  # noqa: S608 - 列名已过白名单
-                    (*values, existing["id"]),
+
+        conn = await self.connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT id, status, detail FROM orders WHERE account_id = ? AND order_id = ?",
+                (account_id, order_id),
+            )
+            existing = await cur.fetchone()
+            if existing is not None:
+                update_fields = dict(fields)
+                previous_status = str(existing["status"] or "")
+                if (
+                    previous_status == "blocked"
+                    and update_fields.get("status") != "blocked"
+                    and "detail" in update_fields
+                ):
+                    update_fields["detail"] = (
+                        str(update_fields.get("detail") or "")
+                        + "（此前曾拦截：" + str(existing["detail"] or "") + "）"
+                    )
+                assignments = ", ".join(
+                    f"{key} = ?" for key in update_fields if key != "account_id"
                 )
+                values = tuple(
+                    value for key, value in update_fields.items() if key != "account_id"
+                )
+                await conn.execute(
+                    f"UPDATE orders SET {assignments} WHERE id = ?",  # noqa: S608 - 列名已过白名单
+                    (*values, int(existing["id"])),
+                )
+                await conn.commit()
                 return int(existing["id"])
 
-        names = self._checked_columns(fields, self._ORDER_COLUMNS)
-        columns = ", ".join(names)
-        placeholders = ", ".join("?" for _ in names)
-        return await self.execute(
-            f"INSERT INTO orders ({columns}) VALUES ({placeholders})",  # noqa: S608 - 列名已过白名单
-            tuple(fields.values()),
-        )
+            columns = ", ".join(names)
+            placeholders = ", ".join("?" for _ in names)
+            cur = await conn.execute(
+                f"INSERT INTO orders ({columns}) VALUES ({placeholders})",  # noqa: S608 - 列名已过白名单
+                tuple(fields.values()),
+            )
+            await conn.commit()
+            return int(cur.lastrowid or 0)
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
 
     async def list_orders(self, limit: int = 100) -> list[dict[str, Any]]:
         return await self.fetch_all("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
@@ -709,6 +753,54 @@ class Database:
                 [(account_id, key, ts) for key in keys],
             )
             await conn.commit()
+        finally:
+            await conn.close()
+
+    async def unmark_messages_seen(self, account_id: int, keys: Iterable[str]) -> int:
+        """撤销「这条已经处理过」的标记。
+
+        消息是在处理**之前**就标记的（否则推送和轮询会各回一遍）。万一下游
+        处理抛异常，这条消息就永久丢了 —— 这时候把标记撤掉，下一轮还能重来。
+        只在异常路径上调，正常流程不会走到这里。
+        """
+        keys = [k for k in keys if k]
+        if not keys:
+            return 0
+        placeholders = ", ".join("?" for _ in keys)
+        conn = await self.connect()
+        try:
+            cur = await conn.execute(
+                # 只拼 "?" 占位符，值全部走参数绑定
+                f"DELETE FROM seen_messages WHERE account_id = ? AND msg_key IN ({placeholders})",  # noqa: S608
+                (account_id, *keys),
+            )
+            changed = cur.rowcount or 0
+            await conn.commit()
+            return changed
+        finally:
+            await conn.close()
+
+    async def prune_history(self, days: int) -> int:
+        """删掉 N 天前的**消息流水**，返回删除条数；days <= 0 = 不删。
+
+        为什么只清 messages：
+          * messages 是最占地方的（每条带完整正文），长期跑会无限涨；
+          * seen_messages 和 reply_hits 一旦删掉，「同一会话只回一次」「这条已经
+            处理过」就同时失效 —— 那会导致给买家重复回复、同一单重复处理，
+            所以宁可留着它们（一行只有几十字节，一年也就几十 MB）。
+        """
+        if days <= 0:
+            return 0
+        cutoff = f"-{int(days)} days"
+        conn = await self.connect()
+        try:
+            cur = await conn.execute(
+                "DELETE FROM messages WHERE created_at < datetime('now', 'localtime', ?)",
+                (cutoff,),
+            )
+            deleted = cur.rowcount or 0
+            await conn.commit()
+            return deleted
         finally:
             await conn.close()
 

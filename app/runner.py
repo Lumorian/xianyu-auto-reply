@@ -37,6 +37,10 @@ BACKOFF = (5, 10, 30, 60, 120)
 #: 风控/滑块不是 Cookie 失效，退避要更长，避免把账号越撞越黑
 RISK_BACKOFF = (60, 180, 300, 600, 900)
 
+#: 同一条消息处理失败最多重试几次（撤销 seen 标记后等下一轮）。
+#: 超过就放弃，免得一条永远解析不了的消息每轮都重试、把日志刷满。
+SEEN_RETRY_LIMIT = 3
+
 
 def _preview(text: str, limit: int = 120) -> str:
     """日志里只放前一小段，长话术文案打全会把日志刷爆。"""
@@ -97,6 +101,8 @@ class AccountWorker:
         self._name_backfilled: set[str] = set()
         #: 本次进程是否已经扫过「历史里叫买家」的旧记录
         self._names_repaired = False
+        #: (会话:消息 id) -> 处理失败次数，用于「撤销 seen 标记」限流
+        self._seen_failures: dict[str, int] = {}
 
     # ------------------------------------------------------------ 生命周期
 
@@ -427,7 +433,40 @@ class AccountWorker:
                 logger.debug("[%s] 消息 %s 已处理过，跳过", self.name, seen_key)
                 return None
             await self.db.mark_messages_seen(self.account_id, [seen_key])
+        try:
+            return await self._handle_incoming(msg, allow_auto_reply=allow_auto_reply)
+        except BaseException:
+            # 处理失败就把「已处理」撤掉，否则这条消息永远丢了（自动回复不会补、
+            # 发货不会重试）。失败次数太多的就不再重试，免得一条坏消息刷屏。
+            await self._forget_seen(seen_key)
+            raise
 
+    async def _forget_seen(self, seen_key: str) -> None:
+        """异常路径专用：撤销 seen 标记，让这条消息下一轮还能重来。
+
+        同一条消息连续失败超过 SEEN_RETRY_LIMIT 次就放弃（否则一条解析不了
+        的消息会被每 20 秒重试一次，日志刷屏、也没人修）。
+        """
+        if not seen_key:
+            return
+        attempts = self._seen_failures.get(seen_key, 0) + 1
+        if len(self._seen_failures) > 500:
+            # 别让这张表本身成为内存泄漏
+            self._seen_failures.clear()
+        self._seen_failures[seen_key] = attempts
+        if attempts > SEEN_RETRY_LIMIT:
+            logger.error("[%s] 消息 %s 已连续失败 %s 次，放弃重试", self.name, seen_key, attempts)
+            return
+        try:
+            await self.db.unmark_messages_seen(self.account_id, [seen_key])
+            logger.warning("[%s] 消息 %s 处理失败，已撤销去重标记，下一轮会重试（第 %s 次）",
+                           self.name, seen_key, attempts)
+        except Exception as exc:
+            logger.warning("[%s] 撤销消息 %s 的去重标记失败：%s", self.name, seen_key, exc)
+
+    async def _handle_incoming(self, msg: IncomingMessage, *,
+                               allow_auto_reply: bool = True) -> asyncio.Task[None] | None:
+        """_process_incoming 的主体（去重之后再执行）。"""
         # 交易卡片本身不带昵称（reminderTitle 是「等待你发货」这类标题），
         # 先按「聊天记录」把真名找回来，再落库 —— 顺序反了的话这条流水
         # 会永久停在「买家」上，而 new-api 的令牌名正是拿它拼的。

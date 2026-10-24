@@ -7,6 +7,7 @@ import base64
 import json
 
 import msgpack
+import pytest
 
 from app.client import RiskControl
 from app.db import Database
@@ -144,6 +145,62 @@ async def test_broken_frame_does_not_raise(db):
     await worker._on_frame("not json")
     await worker._on_frame(json.dumps({"body": {"syncPushPackage": {"data": [{"data": "!!!"}]}}}))
     assert worker.client.sent == []
+
+# ------------------------------------- 处理失败不能把消息永久吞掉
+
+
+async def test_failed_message_is_retried_instead_of_dropped(db, monkeypatch):
+    """处理时抛异常必须撤销 seen 标记，否则这条消息就永远丢了。"""
+    from app.codec import IncomingMessage
+
+    worker, account_id = await build_worker(db)
+    msg = IncomingMessage(
+        chat_id="47983389096", sender_id="4100000001",
+        sender_name="买家小王", content="在吗？", message_id="m-1",
+    )
+    original = worker._handle_incoming
+    calls = {"n": 0}
+
+    async def flaky(message, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("模拟下游异常")
+        return await original(message, **kwargs)
+
+    monkeypatch.setattr(worker, "_handle_incoming", flaky)
+
+    with pytest.raises(RuntimeError):
+        await worker._process_incoming(msg, allow_auto_reply=False)
+    assert await db.messages_seen(account_id, ["47983389096:m-1"]) == set(),         "失败后必须撤销去重标记，下一轮才有机会重来"
+
+    await worker._process_incoming(msg, allow_auto_reply=False)
+    assert [m["content"] for m in await db.list_messages()] == ["在吗？"]
+
+
+async def test_message_that_keeps_failing_is_given_up(db, monkeypatch):
+    """同一条消息连续失败超限就放弃，免得每轮都重试、把日志刷满。"""
+    from app.codec import IncomingMessage
+    from app.runner import SEEN_RETRY_LIMIT
+
+    worker, account_id = await build_worker(db)
+    msg = IncomingMessage(
+        chat_id="c9", sender_id="b9", sender_name="买家", content="坏消息", message_id="m-9",
+    )
+
+    async def always_boom(message, **kwargs):
+        raise RuntimeError("总是失败")
+
+    monkeypatch.setattr(worker, "_handle_incoming", always_boom)
+
+    for _ in range(SEEN_RETRY_LIMIT):
+        with pytest.raises(RuntimeError):
+            await worker._process_incoming(msg, allow_auto_reply=False)
+        assert await db.messages_seen(account_id, ["c9:m-9"]) == set()
+
+    with pytest.raises(RuntimeError):
+        await worker._process_incoming(msg, allow_auto_reply=False)
+    assert await db.messages_seen(account_id, ["c9:m-9"]) == {"c9:m-9"},         "超过重试上限后要保留标记，别再重试"
+
 
 async def test_persist_cookie_writes_back_to_db(db):
     """刷新后的 Cookie（含新 _m_h5_tk）必须写回，否则重启又拿旧 token 撞风控。"""
