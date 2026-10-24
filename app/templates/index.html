@@ -679,7 +679,23 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
 
 <div id="toasts"></div>
 <script>
-var TOKEN = new URLSearchParams(location.search).get("token") || "";
+/* 管理口令从 URL 里读，但读完立刻从地址栏抹掉：
+   ?token=xxx 会进服务端 access log、浏览器历史、截图和 shell history。
+   推荐用 #token=xxx（hash 不会发给服务器）；老的 ?token= 仍然兼容。 */
+function readToken() {
+  var fromHash = new URLSearchParams(location.hash.replace(/^#/, "")).get("token");
+  var fromQuery = new URLSearchParams(location.search).get("token");
+  return fromHash || fromQuery || "";
+}
+var TOKEN = readToken();
+(function stripTokenFromUrl() {
+  try {
+    var hash = location.hash || "";
+    if (hash.indexOf("token=") >= 0) hash = "";
+    if (!location.search && hash === location.hash) return;
+    history.replaceState(null, "", location.pathname + hash);
+  } catch (e) { /* 老浏览器没有 replaceState：忽略 */ }
+})();
 var S = { accounts: [], status: [], rules: [], replyRules: [], cards: [], stock: [], orders: [], messages: [], cfg: null };
 var QR_TIMER = null, QR_SID = null, ITEM_PRICES = {}, EDIT_ID = null, TICK = 0;
 var REPLY_EDIT_ID = null;

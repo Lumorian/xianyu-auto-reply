@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import time
 import uuid
@@ -113,6 +114,54 @@ async def _prune_loop(db: Database, interval: float = 3600.0) -> None:
                 logger.warning("清理消息流水失败：%s", exc)
 
 
+class _RateLimiter:
+    """进程内固定窗口限流。
+
+    单进程部署（本项目就是）够用，重启清零。管理的这几条路要么能猜口令、
+    要么会替我们往外打接口，没有节流就等于把「请求频率」交给对面决定。
+    """
+
+    def __init__(self, limit: int, window: float, *, max_keys: int = 2048) -> None:
+        self.limit = limit
+        self.window = window
+        self.max_keys = max_keys
+        self._hits: dict[str, tuple[float, int]] = {}
+
+    def blocked_for(self, key: str) -> float:
+        """还要等几秒才解除限制；0 表示没被限。"""
+        entry = self._hits.get(key)
+        if entry is None:
+            return 0.0
+        started, count = entry
+        elapsed = time.monotonic() - started
+        if elapsed >= self.window:
+            self._hits.pop(key, None)
+            return 0.0
+        return (self.window - elapsed) if count >= self.limit else 0.0
+
+    def hit(self, key: str) -> None:
+        """记一次。"""
+        now = time.monotonic()
+        if len(self._hits) > self.max_keys:
+            # 键是 IP，正常不会这么多；真被打的时候也不能让这张表变成内存洞
+            self._hits.clear()
+        started, count = self._hits.get(key, (now, 0))
+        if now - started >= self.window:
+            started, count = now, 0
+        self._hits[key] = (started, count + 1)
+
+    def reset(self, key: str) -> None:
+        self._hits.pop(key, None)
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
 def create_app(db: Database | None = None, manager: WorkerManager | None = None) -> FastAPI:
     database = db or Database(settings.db_path)
 
@@ -137,6 +186,64 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     app = FastAPI(title="闲鱼自动发货工具", version="0.1.0", lifespan=lifespan)
     app.state.db = database
     app.state.qr = QrLoginManager()
+
+    #: 允许的 Host 名字。纯 IP（含 [::1]）一律放行：DNS rebinding 必须借域名，
+    #: 用 IP 访问不是攻击面，这样局域网里用 IP 访问也不会被误伤。
+    #: （这里的 0.0.0.0 / [::] 只是 Host 白名单里的字符串，不涉及任何 bind）
+    _ALLOWED_HOSTS = frozenset(
+        {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "[::]"}  # noqa: S104
+        | {part.strip().lower() for part in settings.allowed_hosts.split(",") if part.strip()}
+        | {settings.host.lower()}
+    )
+
+    def _host_ok(request: Request) -> bool:
+        raw = (request.headers.get("host") or "").strip().lower()
+        if not raw:
+            # HTTP/1.0 之类没有 Host：交给后面的鉴权判断，不在这里挡
+            return True
+        if raw.startswith("["):
+            host = raw.split("]")[0] + "]"
+        elif ":" in raw:
+            host = raw.split(":")[0]
+        else:
+            host = raw
+        return host in _ALLOWED_HOSTS or _is_ip_literal(host)
+
+    @app.middleware("http")
+    async def _guard_requests(request: Request, call_next):
+        """Host / 跨站 / 安全响应头。
+
+        Host 校验挡的是 DNS rebinding：恶意页面把自己的域名解析到 127.0.0.1，
+        浏览器就把它当同源，于是「只允许本机」对它完全无效。
+        跨站校验挡的是 CSRF：表单 POST 不需要预检，能直接打到只吃 query 的
+        那几个接口（toggle / reset）。
+        """
+        if not _host_ok(request):
+            logger.warning("拒绝可疑 Host 的请求：%s %s", request.method, request.headers.get("host"))
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Host 不在允许列表里。用域名访问请在 XY_ALLOWED_HOSTS 中配置"},
+            )
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not _same_origin(request):
+            logger.warning("拒绝跨站写请求：%s %s", request.method, request.url.path)
+            return JSONResponse(status_code=403, content={"detail": "跨站请求被拒绝"})
+
+        response = await call_next(request)
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            # 页面是单文件内联脚本 + onclick，必须放行 inline；但依然禁止外域，
+            # 注入进来的 <script src=//evil> 会被拦掉。
+            "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'",
+        )
+        if request.url.path.startswith("/api/"):
+            # 卡密、Cookie、买家昵称都在这些响应里，别留在浏览器磁盘缓存
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
     #: session_id -> 用户填的账号名/备注，扫码成功后用来建账号
     _pending: dict[str, LoginIn] = {}
 
@@ -147,6 +254,42 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         host = (request.client.host if request.client else "") or ""
         return host in ("127.0.0.1", "::1", "localhost") or host.startswith("127.")
 
+    def _client_ip(request: Request) -> str:
+        # 注意：main.py 里 uvicorn 固定 proxy_headers=False，所以这是真实对端，
+        # 不会被客户端自带的 X-Forwarded-For 冒充。
+        return (request.client.host if request.client else "") or "-"
+
+    #: 口令错误次数：10 次/分钟。挡的是「挂到公网后无限猜」。
+    auth_failures = _RateLimiter(limit=10, window=60.0)
+    #: 会替我们往外打接口的端点（扫码登录、拉商品列表）：10 次/分钟。
+    outbound_calls = _RateLimiter(limit=10, window=60.0)
+
+    def _throttle_outbound(request: Request, what: str) -> None:
+        """限制会触发外部请求的接口，别让面板变成打闲鱼/上游的放大器。"""
+        key = f"{what}:{_client_ip(request)}"
+        wait = outbound_calls.blocked_for(key)
+        if wait > 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"{what} 调用太频繁，请 {int(wait) + 1} 秒后再试",
+                headers={"Retry-After": str(int(wait) + 1)},
+            )
+        outbound_calls.hit(key)
+
+    def _same_origin(request: Request) -> bool:
+        """浏览器是不是从「本站」发出的请求。
+
+        只用来挡 CSRF：带 Origin 且和 Host 对不上、或浏览器自己说
+        cross-site，就拒绝。curl 之类没有这两个头，照常能用。
+        """
+        if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            return False
+        origin = request.headers.get("origin")
+        if not origin:
+            return True
+        expected_host = (request.headers.get("host") or "").lower()
+        return origin.lower().split("://", 1)[-1] == expected_host
+
     async def require_admin(
         request: Request,
         x_admin_token: str | None = Header(default=None),
@@ -156,9 +299,10 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
 
         行为：
           * 配了 XY_ADMIN_TOKEN → 必须带对的口令（X-Admin-Token 头，
-            或 Authorization: Bearer <口令>）。
-          * 没配口令 → 只放行本机来源；非本机一律 401，
-            除非显式打开 XY_ADMIN_ALLOW_REMOTE。
+            或 Authorization: Bearer <口令>），错误次数有限流。
+          * 没配口令 → **只**放行本机来源，非本机一律 401。
+            XY_ADMIN_ALLOW_REMOTE 在这里**不生效**：它只放宽「谁能访问」，
+            不校验口令；两者都不配就等于把后台交给任何人，这种组合不能放行。
 
         为什么默认要拦：这些接口能改账号 Cookie、读买家昵称、导出卡密、
         删规则。以前「没配口令 = 谁都能调」，只要放到反代后面就是一扇敞开的门。
@@ -169,18 +313,30 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
 
         expected = settings.admin_token
         if expected:
+            fail_key = f"auth:{_client_ip(request)}"
+            wait = auth_failures.blocked_for(fail_key)
+            if wait > 0:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"口令错误次数过多，请 {int(wait) + 1} 秒后再试",
+                    headers={"Retry-After": str(int(wait) + 1)},
+                )
             # 恒定时间比较：普通 != 会按「第几个字符不同」泄漏时间差。
             # 必须比 bytes —— compare_digest 不接受含非 ASCII 字符的 str，
             # 口令里带中文会直接 TypeError，变成每个请求都 500。
             if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+                auth_failures.hit(fail_key)
+                logger.warning("管理口令错误（来源 %s）", _client_ip(request))
                 raise HTTPException(status_code=401, detail="管理口令错误")
+            auth_failures.reset(fail_key)
             return
 
-        if settings.admin_allow_remote or _is_loopback(request):
+        if _is_loopback(request):
             return
         raise HTTPException(
             status_code=401,
-            detail="未配置 XY_ADMIN_TOKEN，管理接口只允许本机访问；"
+            detail="未配置 XY_ADMIN_TOKEN，管理接口只允许本机访问"
+                   "（XY_ADMIN_ALLOW_REMOTE 只放宽来源、不校验口令，没口令时不会生效）；"
                    "请在 .env 里设置 XY_ADMIN_TOKEN 后再远程使用",
         )
 
@@ -245,6 +401,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     @app.post("/api/login/start", dependencies=guard)
     async def login_start(payload: LoginIn, request: Request) -> dict[str, Any]:
         """生成一个闲鱼登录二维码，返回会话 id。"""
+        _throttle_outbound(request, "生成二维码")
         qr = _qr(request)
         session_id = uuid.uuid4().hex
         try:
@@ -379,8 +536,9 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         return {"ok": True}
 
     @app.get("/api/accounts/{account_id}/items", dependencies=guard)
-    async def list_account_items(account_id: int) -> list[dict[str, Any]]:
+    async def list_account_items(account_id: int, request: Request) -> list[dict[str, Any]]:
         """拉这个账号「在售」的商品，方便在规则里选商品 ID 而不是手抄。"""
+        _throttle_outbound(request, "拉商品列表")
         account = await database.get_account(account_id)
         if account is None or not account["cookie"]:
             raise HTTPException(status_code=404, detail="账号不存在或没有 Cookie")

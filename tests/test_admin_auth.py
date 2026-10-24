@@ -63,7 +63,7 @@ async def call(app, client_host, method, path, **kwargs):
     # raise_app_exceptions=False：让 500 走我们自己的 handler，而不是在测试里炸开
     transport = httpx.ASGITransport(app=app, client=(client_host, 5555),
                                     raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
         async with app.router.lifespan_context(app):
             return await ac.request(method, path, **kwargs)
 
@@ -83,10 +83,100 @@ async def test_loopback_still_works_without_token(tmp_path, monkeypatch):
     assert res.status_code == 200
 
 
-async def test_remote_allowed_when_explicitly_enabled(tmp_path, monkeypatch):
+async def test_allow_remote_without_token_is_refused(tmp_path, monkeypatch):
+    """ALLOW_REMOTE 只放宽来源、不校验口令：没口令时它不能生效（否则等于全开）。"""
     app, _ = make_app(tmp_path, monkeypatch, allow_remote=True)
     res = await call(app, "203.0.113.9", "GET", "/api/orders")
+    assert res.status_code == 401
+    assert "XY_ADMIN_TOKEN" in res.json()["detail"]
+
+    # 配上口令之后，这个开关才有意义：远程带对口令可以进
+    app2, _ = make_app(tmp_path, monkeypatch, token="s3cret", allow_remote=True)
+    ok = await call(app2, "203.0.113.9", "GET", "/api/orders",
+                    headers={"X-Admin-Token": "s3cret"})
+    assert ok.status_code == 200
+
+
+# ------------------------------------------- Host / CSRF / 限流 / 响应头
+
+
+async def test_foreign_host_header_is_rejected(tmp_path, monkeypatch):
+    """DNS rebinding：恶意域名解析到 127.0.0.1 时，Host 不是本机名字 → 拒绝。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(app, "127.0.0.1", "GET", "/api/orders", headers={"Host": "evil.example"})
+    assert res.status_code == 400
+    assert "XY_ALLOWED_HOSTS" in res.json()["detail"]
+
+
+async def test_loopback_and_ip_hosts_are_accepted(tmp_path, monkeypatch):
+    """回环名字、配置的 host、以及任何纯 IP 写法都要放行（局域网用 IP 访问很常见）。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    for host in ("127.0.0.1:8000", "localhost:8000", "10.0.0.5:8000", "[::1]:8000"):
+        res = await call(app, "127.0.0.1", "GET", "/healthz", headers={"Host": host})
+        assert res.status_code == 200, host
+
+
+async def test_allowed_hosts_setting_whitelists_a_domain(tmp_path, monkeypatch):
+    """挂反代用域名访问时，把域名写进 XY_ALLOWED_HOSTS 就能过 Host 校验。"""
+    monkeypatch.setattr("app.config.settings.allowed_hosts", "panel.example.com", raising=False)
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(app, "127.0.0.1", "GET", "/healthz", headers={"Host": "panel.example.com"})
     assert res.status_code == 200
+
+
+async def test_cross_site_write_is_rejected(tmp_path, monkeypatch):
+    """CSRF：浏览器标注为 cross-site 的写请求直接拒（表单 POST 不需要预检）。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "POST", "/api/accounts/999/toggle?enabled=false",
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert res.status_code == 403
+
+
+async def test_cross_origin_write_is_rejected(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "POST", "/api/accounts/999/toggle?enabled=false",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert res.status_code == 403
+
+
+async def test_same_origin_write_is_allowed(tmp_path, monkeypatch):
+    """本站发起的写请求不能被误伤（这里靠 404 证明已经走到业务逻辑）。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "POST", "/api/accounts/999/toggle?enabled=false",
+        headers={"Origin": "http://127.0.0.1", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert res.status_code == 404
+
+
+async def test_security_headers_are_present(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    page = await call(app, "127.0.0.1", "GET", "/")
+    assert page.headers["X-Frame-Options"] == "DENY"
+    assert page.headers["X-Content-Type-Options"] == "nosniff"
+    assert page.headers["Referrer-Policy"] == "no-referrer"
+    assert "frame-ancestors 'none'" in page.headers["Content-Security-Policy"]
+
+    api = await call(app, "127.0.0.1", "GET", "/api/orders")
+    assert api.headers["Cache-Control"] == "no-store", "卡密/订单不能留在浏览器缓存里"
+
+
+async def test_admin_token_bruteforce_is_rate_limited(tmp_path, monkeypatch):
+    """口令错误不能无限猜：10 次/分钟之后直接 429。"""
+    app, _ = make_app(tmp_path, monkeypatch, token="s3cret")
+    for _ in range(10):
+        res = await call(app, "127.0.0.1", "GET", "/api/orders",
+                         headers={"X-Admin-Token": "guess"})
+        assert res.status_code == 401
+
+    blocked = await call(app, "127.0.0.1", "GET", "/api/orders",
+                         headers={"X-Admin-Token": "guess"})
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) > 0
 
 
 async def test_token_is_enforced_everywhere(tmp_path, monkeypatch):

@@ -33,7 +33,7 @@ async def client(tmp_path):
     db = Database(tmp_path / "web.db")
     app = create_app(db=db, manager=StubManager(db))
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
         async with app.router.lifespan_context(app):
             yield ac
 
@@ -205,7 +205,7 @@ async def test_model_limits_setting_survives_restart_and_wins_over_env(client, m
     db = client._transport.app.state.db
     app = create_app(db=db, manager=StubManager(db))
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
         async with app.router.lifespan_context(app):
             cfg = (await ac.get("/api/config")).json()
     assert cfg["newapi"]["model_limits"] == "from-web"
@@ -264,7 +264,7 @@ async def test_saving_model_limits_updates_the_running_provisioner(tmp_path):
     )
     app = create_app(db=db, manager=manager)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
         async with app.router.lifespan_context(app):
             res = await ac.put(
                 "/api/config/settings", json={"model_limits": "deepseek-v4.1-flash, deepseek-v4.1"}

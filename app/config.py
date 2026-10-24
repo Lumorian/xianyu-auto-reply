@@ -78,6 +78,10 @@ class Settings:
     admin_allow_remote: bool = field(default_factory=lambda: _bool("XY_ADMIN_ALLOW_REMOTE", False))
     log_level: str = field(default_factory=lambda: os.getenv("XY_LOG_LEVEL", "INFO"))
     #: 日志文件路径。留空则只输出到控制台（交给 systemd / docker 收走）
+    #: 管理后台额外允许的 Host（逗号分隔）。默认只认回环名字、XY_HOST 和纯 IP；
+    #: 挂到反代后面用域名访问时必须在这里加上域名，否则会被 Host 校验挡掉
+    #: （那是为了挡 DNS rebinding：恶意站点把自己的域名解析到 127.0.0.1）。
+    allowed_hosts: str = field(default_factory=lambda: os.getenv("XY_ALLOWED_HOSTS", ""))
     log_file: str = field(default_factory=lambda: os.getenv("XY_LOG_FILE", "./logs/server.log"))
     #: 单个日志文件上限（字节），默认 10 MB
     log_max_bytes: int = field(default_factory=lambda: _int("XY_LOG_MAX_BYTES", 10 * 1024 * 1024))
