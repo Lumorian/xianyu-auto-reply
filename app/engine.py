@@ -459,7 +459,15 @@ class DeliveryEngine:
 
     def mark_delivered(self, account_id: int, order_id: str | None) -> None:
         if order_id:
-            self._last_delivery[(account_id, order_id)] = time.time()
+            now = time.time()
+            self._last_delivery[(account_id, order_id)] = now
+            # 这个字典按订单号增长，长年运行会慢慢吃掉内存；冷却期只有十分钟，
+            # 过期的条目没有任何保留价值。
+            if len(self._last_delivery) > 2000:
+                cutoff = now - self.cooldown
+                self._last_delivery = {
+                    key: stamp for key, stamp in self._last_delivery.items() if stamp >= cutoff
+                }
 
     async def decide_order(self, account_id: int, msg: IncomingMessage) -> Decision:
         """订单触发的决策：跳过「是否发货触发语」这一步。

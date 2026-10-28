@@ -153,6 +153,98 @@ async def test_synced_history_dedupes_against_polled_messages(db):
     assert [row["content"] for row in rows] == ["老消息", "新消息"]
 
 
+# --------------------------------------------------- 商品名（聊天列表显示用）
+
+
+async def test_chat_list_shows_item_title(db):
+    """会话列表显示商品名：推来的消息里带着 itemTitle，要记下来给列表用。"""
+    account_id = await db.upsert_account("主号", "cookie")
+    await seed_message(db, account_id, item_id="i1", item_title="GPT 会员代充（月卡）")
+
+    chat = (await db.list_chats())[0]
+    assert chat["item_id"] == "i1"
+    assert chat["item_title"] == "GPT 会员代充（月卡）"
+
+    # 之后这个会话再来消息、哪怕没带标题，也能按商品 ID 借到同一个名字
+    await seed_message(db, account_id, content="在的", kind="outgoing", item_id="i1")
+    assert (await db.list_chats())[0]["item_title"] == "GPT 会员代充（月卡）"
+
+
+async def test_chat_title_falls_back_to_same_chat_item(db):
+    """后台自己发出去的消息行常常没有 item_id，标题得靠同一个会话里带 ID 的那条。"""
+    account_id = await db.upsert_account("主号", "cookie")
+    await seed_message(db, account_id, item_id="i9", item_title="Kimi 会员")
+    await seed_message(db, account_id, content="我发出的回复", kind="outgoing",
+                       item_id=None, item_title="")
+
+    chat = (await db.list_chats())[0]
+    assert chat["item_id"] is None
+    assert chat["item_title"] == "Kimi 会员"
+
+
+async def test_remember_item_titles_is_cheap_and_safe(db):
+    """拉商品列表时批量记标题：空 ID / 空标题跳过，标题没变就不写库。"""
+    changed = await db.remember_item_titles([("i1", "月卡"), ("", "没商品 ID"), ("i2", "   ")])
+    assert changed == 1
+    assert await db.item_titles(["i1", "i2", "nope"]) == {"i1": "月卡"}
+
+    # 每轮消息都会调一次，标题没变必须什么也不做
+    assert await db.remember_item_title("i1", "月卡") is False
+    assert await db.remember_item_title("i1", "月卡 Pro") is True
+    assert await db.item_titles(["i1"]) == {"i1": "月卡 Pro"}
+
+    # 空标题不能把已有标题抹掉（有些回调里 title 字段就是空的）
+    assert await db.remember_item_title("i1", "   ") is False
+    assert await db.item_titles(["i1"]) == {"i1": "月卡 Pro"}
+    assert await db.item_titles([]) == {}
+
+
+# ------------------------------------------------------------------ 删除会话
+
+
+async def test_delete_chat_clears_local_records_only(db):
+    """删会话 = 纯本地清理：消息流水 + 这个会话的自动回复命中记录。"""
+    account_id = await db.upsert_account("主号", "cookie")
+    other_account = await db.upsert_account("小号", "cookie2")
+    await seed_message(db, account_id, content="在吗")
+    await seed_message(db, account_id, content="在的", kind="outgoing")
+    await seed_message(db, account_id, chat_id="c2", sender_id="b2", content="别的会话")
+    await seed_message(db, other_account, content="同一个 chat_id，另一个账号")
+
+    await db.record_reply_hit(account_id, "b1", "c1", 1)
+    await db.record_reply_hit(account_id, "b2", "c2", 1)
+    await db.mark_messages_seen(account_id, ["m-1"])
+
+    removed = await db.delete_chat(account_id, " c1 ")
+    assert removed == {"messages": 2, "reply_hits": 1}
+
+    assert await db.list_chat_messages(account_id, "c1") == []
+    assert await db.get_chat(account_id, "c1") is None
+    assert [c["chat_id"] for c in await db.list_chats(account_id=account_id)] == ["c2"]
+
+    # 命中记录跟着删：不然会话重新出现时自动回复会以为「早回过」而不吭声
+    assert await db.reply_hit_exists(account_id, "b1", "c1", 1) is False
+    assert await db.reply_hit_exists(account_id, "b2", "c2", 1) is True
+
+    # 已处理标记故意留着：删掉的话下一轮轮询会把最后一条消息重新导进来，会话原地复活
+    assert await db.messages_seen(account_id, ["m-1"]) == {"m-1"}
+
+    # 别的账号碰巧用同一个 chat_id，不能被误删
+    assert len(await db.list_chat_messages(other_account, "c1")) == 1
+
+    with pytest.raises(ValueError):
+        await db.delete_chat(account_id, "   ")
+
+
+async def test_delete_chat_twice_is_harmless(db):
+    """删过的会话再删一次只是 0 条，不能报错（用户会连点两下）。"""
+    account_id = await db.upsert_account("主号", "cookie")
+    await seed_message(db, account_id, content="在吗")
+
+    assert (await db.delete_chat(account_id, "c1"))["messages"] == 1
+    assert await db.delete_chat(account_id, "c1") == {"messages": 0, "reply_hits": 0}
+
+
 # ------------------------------------------------------------------ Worker
 
 
@@ -373,3 +465,26 @@ async def test_chat_send_validates_empty_text(chat_client):
         "account_id": account_id, "to_id": "b1", "text": "   ",
     })
     assert res.status_code == 400
+
+
+async def test_chat_delete_api_clears_one_conversation(chat_client):
+    client, _, db = chat_client
+    account_id = await db.upsert_account("主号", "cookie")
+    await seed_message(db, account_id, content="在吗？")
+
+    res = await client.delete(f"/api/chats/c1?account_id={account_id}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["messages"] == 1
+    assert (await client.get("/api/chats")).json() == []
+
+    # 再删一次：0 条，不报错
+    again = await client.delete(f"/api/chats/c1?account_id={account_id}")
+    assert again.status_code == 200
+    assert again.json()["messages"] == 0
+
+    # 会话 ID 是空白 → 400，别真去删别的会话
+    assert (await client.delete(f"/api/chats/%20%20?account_id={account_id}")).status_code == 400
+    # 账号必填：少了就 422，不能瞎猜删到哪个账号头上
+    assert (await client.delete("/api/chats/c1")).status_code == 422

@@ -32,6 +32,7 @@ from .media import (
     compress_image,
     parse_image_upload_response,
 )
+from .memory import cap_mapping
 from .sign import (
     MAX_COOKIE_NAME_LEN,
     MAX_COOKIE_STRING_LEN,
@@ -802,6 +803,7 @@ class XianyuClient:
                 _IM_TOKEN_CACHE[self.user_id] = (
                     str(token), effective_tk, self.cookie_str, time.time() + ttl
                 )
+                cap_mapping(_IM_TOKEN_CACHE, 500)
             return str(token)
         if _is_risk_control(ret):
             self.invalidate_im_token()
@@ -1253,6 +1255,9 @@ class XianyuClient:
             "media_height": media_h,
             "media_duration": media_d,
             "item_id": item_id,
+            # 商品标题：会话 extension 里有就带出来（拉会话列表那条路有），
+            # 后台拿它把「商品 1093…」换成商品名。历史和推送路径没有就留空。
+            "item_title": " ".join(str(session_ext.get("itemTitle") or "").split()),
             "buyer_id": buyer_id,
             # reminderTitle 在交易卡片里是标题（「等待你发货」），不是昵称。
             # 会话 extension 里带的是对方资料，那是真名，优先用它；

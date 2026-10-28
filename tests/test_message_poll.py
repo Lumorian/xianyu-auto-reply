@@ -41,6 +41,7 @@ def conversation(
     reminder_url=None,
     content_payload=None,
     order_id="",
+    item_title=None,
 ):
     url = reminder_url or (
         f"fleamarket://message_chat?itemId={item}&peerUserId={sender}&sid={chat}"
@@ -54,6 +55,8 @@ def conversation(
     }
     if order_id:
         session_ext["orderId"] = order_id
+    if item_title:
+        session_ext["itemTitle"] = item_title
     return {
         "type": 1,
         "singleChatUserConversation": {
@@ -105,6 +108,17 @@ def test_parse_conversation_extracts_fields():
     assert parsed["item_id"] == ITEM
     assert parsed["message_id"] == "4358042467840.PNM"
     assert parsed["from_me"] is False
+
+
+def test_parse_conversation_carries_item_title():
+    """会话扩展里带着商品名时，要一起带出来（聊天列表靠它显示名字）。"""
+    parsed = client()._parse_conversation(conversation(item_title="  GPT  会员   代充（月卡） "))
+    assert parsed is not None
+    assert parsed["item_id"] == ITEM
+    assert parsed["item_title"] == "GPT 会员 代充（月卡）"
+
+    # 没有标题的老会话：空串而不是 None，前端才好统一处理
+    assert client()._parse_conversation(conversation())["item_title"] == ""
 
 
 def test_parse_conversation_marks_own_messages():
@@ -322,6 +336,34 @@ async def test_old_history_is_not_replayed_after_baseline(db, fast):
     assert "old-1" not in incoming
     logged = next(m for m in await db.list_messages() if m["content"] == "new message")
     assert logged["created_at"] == iso_from_ms(1792815200000)
+
+
+async def test_pulled_message_records_item_title(db, fast):
+    """「拉」这条路收到的新消息也要把商品名写进库，聊天列表才能显示名字。"""
+    worker = await build_worker(db, [
+        conversation(text="在吗", message_id="m-old", item_title="GPT 会员代充（月卡）")
+    ])
+    await save_item_reply(db)
+    set_connected_at(worker, 1792813119548)
+    await worker._poll_recent_messages()   # 基线：老消息只标 seen，不记流水
+    await finish_replies(worker)
+    assert await db.list_chats() == []
+
+    worker.client.conversations = [
+        conversation(text="在吗", message_id="m-title", create_at=1792813999000,
+                     item_title="GPT 会员代充（月卡）")
+    ]
+    assert await worker._poll_recent_messages() == 1
+    await finish_replies(worker)
+
+    chats = await db.list_chats()
+    assert chats[0]["item_id"] == ITEM
+    assert chats[0]["item_title"] == "GPT 会员代充（月卡）"
+
+    # 之后后台自己回一条（没有 item_id 的那种行），标题还得借得到
+    await worker.send_manual_text(CHAT, BUYER, "已经发货了")
+    chats = await db.list_chats()
+    assert chats[0]["item_title"] == "GPT 会员代充（月卡）"
 
 
 async def test_seller_sent_paid_card_delivers_through_pull_path(db):

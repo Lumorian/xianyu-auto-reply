@@ -13,6 +13,13 @@
 
 set -euo pipefail
 
+# 512 MB 小机器的两个基础保险：
+# * MALLOC_ARENA_MAX：glibc 默认每个线程一个 arena（64 MB 虚拟地址），
+#   多账号 + aiosqlite 的线程很快就能把地址空间撑得很难看；2 个足够。
+# * PYTHONUNBUFFERED：进程被 OOM killer 干掉时，最后几条日志不会留在缓冲区里。
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+
 # 不管从哪调用，都切到脚本所在目录，否则 .env / data/ 的相对路径全错。
 # 必须解析符号链接：把 start.sh 软链到 ~/bin 之类的目录时，BASH_SOURCE 指向的是
 # 那个链接本身，dirname 会得到链接所在目录 —— 曾经因此在错误的地方建出 .venv。
@@ -71,7 +78,8 @@ find_python() {
   return 1
 }
 
-# 装依赖：优先用 pip；这个 venv 里没有 pip 时依次退到 uv、get-pip.py。
+# 装依赖：优先用 pip；没有 pip 时依次退到 uv、Python 自带的 ensurepip。
+# 不从网上抓 get-pip.py 执行：多一个远程脚本就多一条供应链攻击面。
 # 为什么不能直接假设有 pip：用 `uv venv` 或 `python -m venv --without-pip` 建的
 # 虚拟环境根本没有 pip，一句 `python -m pip` 就报 "No module named pip"，
 # 而这个报错特别容易让人以为是网络或权限问题。
@@ -93,19 +101,13 @@ install_requirements() {
     return 0
   fi
 
-  info "${C_DIM}（没有 pip 也没有 uv，尝试引导 pip）${C_OFF}"
-  local getpip=".venv/get-pip.py"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$getpip" 2>/dev/null || true
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q https://bootstrap.pypa.io/get-pip.py -O "$getpip" 2>/dev/null || true
-  fi
-  if [ -s "$getpip" ] && "$py" "$getpip" >/dev/null 2>&1; then
-    rm -f "$getpip"
+  info "${C_DIM}（没有 pip 也没有 uv，尝试用 Python 自带的 ensurepip）${C_OFF}"
+  if "$py" -m ensurepip --upgrade >/dev/null 2>&1; then
     "$py" -m pip install --quiet -r "$REQ"
     return $?
   fi
-  rm -f "$getpip"
+
+  info "${C_DIM}（ensurepip 也不可用，无法安装依赖）${C_OFF}"
   return 1
 }
 

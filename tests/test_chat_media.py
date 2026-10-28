@@ -133,6 +133,20 @@ async def test_manual_video_uploads_poster_and_keeps_local_preview(db, tmp_path,
     assert (tmp_path / "media" / "chat" / row["local_poster"]).exists()
 
 
+async def test_manual_video_forces_video_suffix_on_disk(db, tmp_path, monkeypatch):
+    """文件名可以是任意文本，但落盘后缀必须是已知视频格式。"""
+    monkeypatch.setattr(settings, "media_dir", tmp_path / "media")
+    video = make_video(tmp_path)
+    worker, _account_id, _client = await build_worker(db)
+    message = await worker.send_manual_video("c1", "b1", video, "evil.html")
+
+    row = await db.get_message(int(message["id"]))
+    assert row is not None
+    assert row["local_media"].endswith(".mp4")
+    assert not row["local_media"].endswith(".html")
+    assert (tmp_path / "media" / "chat" / row["local_media"]).exists()
+
+
 async def test_manager_recalls_recent_outgoing_message(db):
     worker, account_id, client = await build_worker(db)
     message_id = await db.log_message(
@@ -241,6 +255,26 @@ async def test_builtin_image_upload_list_content_delete(media_client):
     assert (await client.get("/api/media/images")).json() == []
 
 
+async def test_builtin_image_content_ignores_db_mime(media_client):
+    """内置图片按磁盘后缀发 MIME，旧库里的 text/html 不能生效。"""
+    client, _, db = media_client
+    folder = settings.media_dir / "builtin"
+    folder.mkdir(parents=True, exist_ok=True)
+    name = "legacy.html"
+    payload = b"<script>alert(1)</script>"
+    (folder / name).write_bytes(payload)
+    image_id = await db.save_builtin_image(
+        name="旧图", filename=name, mime="text/html",
+        size=len(payload), width=1, height=1,
+    )
+
+    got = await client.get(f"/api/media/images/{image_id}/content")
+    assert got.status_code == 200
+    assert got.content == payload
+    assert got.headers["content-type"] == "application/octet-stream"
+    assert got.headers["content-disposition"] == "attachment"
+
+
 async def test_prune_media_dir_removes_old_chat_copies(tmp_path):
     """聊天视频的本地副本要跟消息保留期一起清理；新文件不能误删。"""
     root = tmp_path / "media"
@@ -325,4 +359,30 @@ async def test_recall_endpoint_and_local_media(media_client, tmp_path):
     got = await client.get(f"/api/messages/{message_id}/media?account_id={account_id}&kind=media")
     assert got.status_code == 200
     assert got.content == b"video-bytes"
+    assert got.headers["content-type"] == "video/mp4"
+    assert "attachment" not in got.headers.get("content-disposition", "")
     assert (await client.get(f"/api/messages/{message_id}/media?account_id=999&kind=media")).status_code == 404
+
+
+async def test_local_media_never_served_as_html(media_client):
+    """旧数据里即使有 .html 本地文件，也只能当附件下载，不能同源渲染。"""
+    client, _, db = media_client
+    account_id = await db.upsert_account("主号", "cookie")
+    payload = b"<script>alert(1)</script>"
+    # 模拟旧版本/手工改库留下的 .html 文件：新 save_media_file 已不会产生这种后缀
+    folder = settings.media_dir / "chat"
+    folder.mkdir(parents=True, exist_ok=True)
+    media_name = "legacy-evil.html"
+    (folder / media_name).write_bytes(payload)
+    message_id = await db.log_message(
+        account_id=account_id, chat_id="c1", sender_id="b1", content="[视频]",
+        kind="outgoing", message_type="video", local_media=media_name,
+        external_id="m-evil", created_at=now_iso(),
+    )
+
+    got = await client.get(f"/api/messages/{message_id}/media?account_id={account_id}&kind=media")
+    assert got.status_code == 200
+    assert got.content == payload
+    assert got.headers["content-type"] == "application/octet-stream"
+    assert got.headers["content-disposition"] == "attachment"
+    assert "text/html" not in got.headers["content-type"]

@@ -1761,6 +1761,15 @@ async def test_web_bind_list_and_unbind_buyer_key(web_client):
     assert await db.get_buyer_key("4100000001") is None
 
 
+async def test_web_buyer_key_rejects_path_like_token_id(web_client):
+    """token_id 会拼进上游 URL，不能让管理员输入 ../ 改路径。"""
+    client, _ = web_client
+    res = await client.post("/api/buyer-keys", json={
+        "buyer_id": "4100000001", "token_id": "../self",
+    })
+    assert res.status_code == 422
+
+
 async def test_web_bind_by_api_key_and_conflicts(web_client):
     client, db = web_client
     res = await client.post("/api/buyer-keys", json={

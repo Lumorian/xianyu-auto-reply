@@ -521,6 +521,10 @@ async def test_buyer_account_binding_api(tmp_path, monkeypatch):
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
         async with app.router.lifespan_context(app):
             res = await ac.post("/api/buyer-accounts", json={
+                "buyer_id": "b1", "user_id": "../self", "username": "abc",
+            })
+            assert res.status_code == 422, "user_id 会拼进上游 URL，必须拒绝路径字符"
+            res = await ac.post("/api/buyer-accounts", json={
                 "buyer_id": "b1", "username": "abc", "password": "pw12345678",
             })
             assert res.status_code == 200
@@ -545,10 +549,25 @@ async def test_buyer_account_binding_api(tmp_path, monkeypatch):
             assert (await ac.get("/api/buyer-accounts")).json() == []
 
 
-async def test_index_page_has_buyer_accounts_view(client):
+async def test_index_page_drops_buyer_binding_views(client):
+    """「账号模式 / 充值已有 Key」下线后，两个买家绑定页也一起撤了。
+
+    页面里不该再出现这两个视图的壳子 / 导航项，脚本里也不该留着它们的 JS，
+    但要留一句「已下线」的说明 —— 老规则还能跑，别让人以为它凭空消失了。
+    """
     res = await client.get("/")
     assert res.status_code == 200
-    assert "买家账号" in res.text
-    assert "view-buyeraccounts" in res.text
-    assert "账号模式" in res.text
+    assert "buyerkeys" not in res.text
+    assert "buyeraccounts" not in res.text
+    assert "view-buyer" not in res.text
+    assert "已下线" in res.text
+
+
+async def test_index_page_rule_mode_cannot_pick_legacy_modes(client):
+    """发货模式下拉里不能再有 account / topup 两个选项（老规则靠 JS 临时补回）。"""
+    res = await client.get("/")
+    assert res.status_code == 200
+    assert '<option value="account">' not in res.text
+    assert '<option value="topup">' not in res.text
+    assert '<option value="redeem">' in res.text
 

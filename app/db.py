@@ -214,6 +214,16 @@ CREATE TABLE IF NOT EXISTS item_models (
     updated_at TEXT NOT NULL
 );
 
+-- 商品标题缓存：聊天界面要显示「商品名称」，而不是一串商品 ID。
+-- 卖家自己看后台时最想认的是「哪件商品」，数字 ID 谁也记不住。
+-- 消息本身不存标题（同一商品的每条消息都带一份纯属浪费），按 item_id 单列一张表。
+CREATE TABLE IF NOT EXISTS item_titles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 -- 内置图片库：在后台传一次，聊天时一键发送。
 CREATE TABLE IF NOT EXISTS builtin_images (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -738,6 +748,62 @@ class Database:
 
     async def delete_item_model(self, row_id: int) -> None:
         await self.execute("DELETE FROM item_models WHERE id = ?", (row_id,))
+
+    # ------------------------------------------------------------ 商品标题
+
+    async def remember_item_title(self, item_id: str | None, title: str | None) -> bool:
+        """记下「这个商品叫什么」。标题没变就不写，返回是否真的改了。
+
+        标题只有一个来源是权威的：闲鱼自己给的 itemTitle。所以后来的覆盖先前的
+        就够（商品改名后，下一轮消息 / 下一次拉商品列表会自动纠正），
+        不需要版本号那一套。
+        """
+        key = str(item_id or "").strip()
+        text = str(title or "").strip()
+        # 没商品 ID 就没地方挂；空标题不能覆盖已有的（有些回调里标题字段是空的）
+        if not key or not text:
+            return False
+        row = await self.fetch_one("SELECT title FROM item_titles WHERE item_id = ?", (key,))
+        if row is not None and str(row["title"] or "") == text:
+            return False
+        await self.execute(
+            "INSERT INTO item_titles (item_id, title, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(item_id) DO UPDATE SET title = excluded.title,"
+            " updated_at = excluded.updated_at",
+            (key, text, now_iso()),
+        )
+        return True
+
+    async def remember_item_titles(self, pairs: Sequence[tuple[str, str]]) -> int:
+        """批量记商品标题（拉商品列表时一次写全），返回改动条数。"""
+        changed = 0
+        for item_id, title in pairs:
+            try:
+                if await self.remember_item_title(item_id, title):
+                    changed += 1
+            except Exception:
+                # 一条写不进去不该让整个「拉商品列表」失败：这个接口同时还在
+                # 给用户选规则商品，标题只是附带的便利。
+                logger.debug("记商品标题失败：%s", item_id, exc_info=True)
+        return changed
+
+    async def item_titles(self, item_ids: Sequence[str]) -> dict[str, str]:
+        """按商品 ID 批量取标题，返回 {item_id: title}（取不到的就不在结果里）。"""
+        keys = [str(k).strip() for k in item_ids if str(k or "").strip()]
+        if not keys:
+            return {}
+        placeholders = ", ".join("?" for _ in keys)
+        rows = await self.fetch_all(
+            # 只拼占位符，值走参数绑定
+            f"SELECT item_id, title FROM item_titles"  # noqa: S608
+            f" WHERE item_id IN ({placeholders})",
+            tuple(keys),
+        )
+        return {
+            str(row["item_id"]): str(row["title"] or "")
+            for row in rows
+            if str(row["title"] or "").strip()
+        }
 
     # ------------------------------------------------------------ 买家 Key
 
@@ -2120,6 +2186,16 @@ class Database:
         可能拿到同一条消息，重复写会让聊天界面出现两条一模一样的对话。
         """
         fields.setdefault("created_at", now_iso())
+        # 商品标题不是 messages 的列（同一商品每条消息存一份纯属浪费），
+        # 进不了白名单；顺手记到 item_titles，聊天界面就能一直显示商品名。
+        # 放在这里是因为所有落库路径（推送 / 轮询 / 手动发送 / 补拉历史）都走这个函数。
+        item_title = str(fields.pop("item_title", "") or "")
+        if item_title:
+            try:
+                await self.remember_item_title(fields.get("item_id"), item_title)
+            except Exception:
+                # 标题只是展示用，写不进去也不能把消息流水带崩
+                logger.debug("记商品标题失败：%s", item_title, exc_info=True)
         external_id = str(fields.get("external_id") or "").strip()
         fields["external_id"] = external_id or None
         names = self._checked_columns(fields, self._MESSAGE_COLUMNS)
@@ -2323,6 +2399,15 @@ class Database:
     _CHAT_SELECT = (
         "SELECT m.id, m.account_id, a.name AS account_name, m.chat_id, m.sender_id,"
         " m.sender_name, m.item_id, m.order_id, m.content, m.kind, m.created_at,"
+        # 商品标题单独存（item_titles），会话列表这里带出来给前端显示。
+        # 先按这一行的商品找；这一行没带商品 ID（后台发出的消息常常没有）就退到
+        # 「这个会话里最近一条带商品 ID 的消息」—— 闲鱼会话是一买家 × 一商品，
+        # 同一会话里的商品 ID 本来就是同一个，标题也就跟着是同一个。
+        # 还是取不到就返回空串，前端自己退回显示商品 ID。
+        " COALESCE((SELECT t.title FROM item_titles t WHERE t.item_id = m.item_id),"
+        "  (SELECT t.title FROM item_titles t JOIN messages x ON x.item_id = t.item_id"
+        "   WHERE x.account_id = m.account_id AND x.chat_id = m.chat_id"
+        "   ORDER BY x.created_at DESC, x.id DESC LIMIT 1), '') AS item_title,"
         " (SELECT COUNT(*) FROM messages u WHERE u.account_id = m.account_id"
         "  AND u.chat_id = m.chat_id AND u.kind = 'incoming' AND u.read_at IS NULL) AS unread,"
         " (SELECT u.sender_id FROM messages u WHERE u.account_id = m.account_id"
@@ -2412,6 +2497,39 @@ class Database:
             changed = cur.rowcount or 0
             await conn.commit()
             return changed
+        finally:
+            await conn.close()
+
+    async def delete_chat(self, account_id: int, chat_id: str) -> dict[str, int]:
+        """删掉一个会话的本地记录，返回删掉的行数。
+
+        闲鱼**没有**「删除会话」接口（WS 里只有建会话 / 拉会话 / 拉历史），
+        所以这是纯本地清理：消息流水 + 这条会话的自动回复命中记录。
+
+        为什么连 reply_hits 一起删：那张表记的是「这个会话已经回过哪条规则」。
+        记录删了、命中记录留着的话，重新导入同一个会话时自动回复会以为
+        「早就回过了」而一声不吭 —— 用户删完再点开，看着像功能坏了。
+
+        相反，seen_messages **故意不删**：它记的是「这条消息处理过了」。
+        删掉的话，下一轮轮询会把这个会话的最后一条消息当成新消息重新导进来，
+        会话立刻原地复活，看着像没删掉。
+        """
+        account = int(account_id)
+        chat = str(chat_id or "").strip()
+        if not chat:
+            raise ValueError("缺少会话 ID")
+        conn = await self.connect()
+        try:
+            cur = await conn.execute(
+                "DELETE FROM messages WHERE account_id = ? AND chat_id = ?", (account, chat)
+            )
+            messages = cur.rowcount or 0
+            cur = await conn.execute(
+                "DELETE FROM reply_hits WHERE account_id = ? AND chat_key = ?", (account, chat)
+            )
+            hits = cur.rowcount or 0
+            await conn.commit()
+            return {"messages": messages, "reply_hits": hits}
         finally:
             await conn.close()
 

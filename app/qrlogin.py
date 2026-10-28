@@ -305,7 +305,7 @@ class QrLoginManager:
             logger.debug("查询扫码状态失败：%s", exc)
             return session
         if not isinstance(payload, dict):
-            logger.debug("查询扫码状态返回结构异常：%r", payload)
+            logger.debug("查询扫码状态返回结构异常：类型=%s", type(payload).__name__)
             return session
 
         status = str(payload.get("qrCodeStatus") or "NEW")
@@ -347,7 +347,8 @@ class QrLoginManager:
                 },
             )
         except httpx.HTTPError as exc:
-            logger.warning("login_token 调用失败（继续尝试收 Cookie）：%s", exc)
+            # 异常文本里可能带请求 URL（含 token 查询参数），日志只留类型。
+            logger.warning("login_token 调用失败（继续尝试收 Cookie）：%s", type(exc).__name__)
         await self._finalize(session)
 
     async def _finalize(self, session: QrSession) -> None:

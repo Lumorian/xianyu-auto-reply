@@ -83,6 +83,25 @@ def test_probe_video_and_poster(tmp_path):
     assert (width, height) == (64, 48)
 
 
+def test_video_pixel_bomb_rejected(monkeypatch):
+    monkeypatch.setattr(media, "has_ffmpeg", lambda: True)
+    payload = b'{"streams":[{"width":16000,"height":16000,"duration":"1"}]}'
+    monkeypatch.setattr(media, "_run", lambda *args, **kwargs: payload)
+    with pytest.raises(media.MediaError, match="分辨率太大"):
+        media.probe_video(b"fake")
+    with pytest.raises(media.MediaError, match="分辨率太大"):
+        media.video_poster(b"fake", media.VideoInfo(width=16000, height=16000, duration_ms=1000))
+
+
+def test_video_extension_whitelist():
+    assert media.video_extension("clip.mp4") == ".mp4"
+    assert media.video_extension("clip.MOV") == ".mov"
+    assert media.video_extension("evil.html") == ".mp4"
+    assert media.video_extension("no-extension") == ".mp4"
+    assert media.video_mime("clip.mp4") == "video/mp4"
+    assert media.video_mime("evil.html") is None
+
+
 def test_save_media_file_and_path_traversal(tmp_path):
     name = media.save_media_file(tmp_path, "chat", b"abc", ".mp4")
     assert (tmp_path / "chat" / name).read_bytes() == b"abc"
@@ -90,3 +109,11 @@ def test_save_media_file_and_path_traversal(tmp_path):
         media.local_media_path(tmp_path, "chat", "..", "..", "etc", "passwd")
     with pytest.raises(media.MediaError):
         media.local_media_path(tmp_path, "/etc/passwd")
+
+
+def test_save_media_file_only_allows_known_media_suffixes(tmp_path):
+    assert media.save_media_file(tmp_path, "chat", b"x", ".mp4").endswith(".mp4")
+    assert media.save_media_file(tmp_path, "chat", b"x", "png").endswith(".png")
+    assert media.save_media_file(tmp_path, "chat", b"x", ".html").endswith(".bin")
+    assert media.image_mime("photo.PNG") == "image/png"
+    assert media.image_mime("evil.html") is None

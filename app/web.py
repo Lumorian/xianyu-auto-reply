@@ -6,15 +6,15 @@ import asyncio
 import hmac
 import ipaddress
 import logging
-import mimetypes
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from . import media as media_tools
@@ -35,6 +35,7 @@ from .config import (
     upstream_ready,
 )
 from .db import Database
+from .memory import cap_mapping, rss_mb
 from .qrlogin import STATUS_TEXT, LoginError, QrLoginManager, render_qr_png
 from .runner import WorkerManager
 from .secrets import CookieVault
@@ -52,6 +53,10 @@ logger = logging.getLogger(__name__)
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
+#: 首页 HTML 的进程内缓存。模板只有几百 KB，但后台页面每 5 秒轮询时
+#: 每次重新读盘既费 IO 又会在内存里反复分配大字符串；读一次就够了。
+_TEMPLATE_HTML: str | None = None
+
 #: 站点货币的进程内缓存：base_url -> (取回时刻, 货币)。
 #: 前端每 5 秒拉一次 /api/config，不能每次都去问上游。
 _SITE_CURRENCY_CACHE: dict[str, tuple[float, str]] = {}
@@ -60,23 +65,23 @@ _SITE_CURRENCY_TTL = 60.0
 
 class AccountIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    cookie: str = ""
-    remark: str = ""
+    cookie: str = Field(default="", max_length=8192)
+    remark: str = Field(default="", max_length=200)
     enabled: bool = True
 
 
 class RuleIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    item_id: str = "*"
+    item_id: str = Field(default="*", max_length=64)
     enabled: bool = True
     #: upstream = 按订单金额建 Key 出卡密；topup = 充到买家已有 Key（不换 Key）；
     #: account = 问买家有没有账号（没有就开新号发卡密，有就直接充到账号）；
     #: redeem = 生成 new-api 兑换码直接发给买家（买家自己登录兑换）
     mode: str = Field(default="text", pattern="^(text|card|upstream|topup|account|redeem)$")
-    content: str = ""
+    content: str = Field(default="", max_length=5000)
     auto_confirm: bool = False
     priority: int = 0
-    remark: str = ""
+    remark: str = Field(default="", max_length=200)
     #: 规格关键词（可选）：同一商品的不同规格走不同规则；空 = 不限规格
     spec: str = Field(default="", max_length=500)
     #: 充值模式下买家还没有 Key 时：create = 开新 Key 并绑定，fail = 不发货（仅 auto 模式）
@@ -114,7 +119,8 @@ class BuyerKeyIn(BaseModel):
 
     buyer_id: str = Field(min_length=1, max_length=64)
     buyer_name: str = Field(default="", max_length=64)
-    token_id: str = Field(default="", max_length=64)
+    #: 会拼进 new-api 的 /api/token/{id}，只允许安全字符，防止 ../ 改路径。
+    token_id: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9_-]{0,64}$")
     api_key: str = Field(default="", max_length=200)
     remark: str = Field(default="", max_length=200)
 
@@ -128,7 +134,8 @@ class BuyerAccountIn(BaseModel):
 
     buyer_id: str = Field(min_length=1, max_length=64)
     buyer_name: str = Field(default="", max_length=64)
-    user_id: str = Field(default="", max_length=64)
+    #: 会拼进 new-api 的 /api/user/{id}，只允许安全字符，防止 ../ 改路径。
+    user_id: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9_-]{0,64}$")
     username: str = Field(default="", max_length=20)
     password: str = Field(default="", max_length=128)
     remark: str = Field(default="", max_length=200)
@@ -141,8 +148,8 @@ class ReplyRuleEntryIn(BaseModel):
     """
 
     id: int | None = None
-    keywords: str = ""
-    content: str = ""
+    keywords: str = Field(default="", max_length=1000)
+    content: str = Field(default="", max_length=5000)
 
 
 class ReplyRuleIn(BaseModel):
@@ -155,13 +162,13 @@ class ReplyRuleIn(BaseModel):
 
     name: str = Field(default="", max_length=64)
     kind: str = Field(default="keyword", pattern="^(" + "|".join(KINDS) + ")$")
-    item_id: str = "*"
+    item_id: str = Field(default="*", max_length=64)
     #: 兼容旧接口：没有 entries 时，这一组关键词 + content 就是唯一的一条回复
-    keywords: str = ""
+    keywords: str = Field(default="", max_length=1000)
     #: contains 包含 / exact 完全一致 / regex 正则
     match_type: str = Field(default="contains", pattern="^(" + "|".join(MATCH_TYPES) + ")$")
     #: 兼容旧接口：见 keywords
-    content: str = ""
+    content: str = Field(default="", max_length=5000)
     #: 规则里的多条回复；每条有自己的关键词和内容
     entries: list[ReplyRuleEntryIn] = Field(default_factory=list)
     enabled: bool = True
@@ -170,12 +177,12 @@ class ReplyRuleIn(BaseModel):
     #: 同一买家多少秒内不再回同一条回复；0 = 不限制
     cooldown: int = 60
     priority: int = 0
-    remark: str = ""
+    remark: str = Field(default="", max_length=200)
 
 
 class LoginIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    remark: str = ""
+    remark: str = Field(default="", max_length=200)
 
 
 class SettingsIn(BaseModel):
@@ -242,9 +249,10 @@ class ChatRecallIn(BaseModel):
 
 
 class CardsIn(BaseModel):
-    item_id: str = "*"
-    contents: list[str] = Field(default_factory=list)
-    raw_text: str = ""
+    item_id: str = Field(default="*", max_length=64)
+    #: 卡密通常只有几十个字符；给足上限，同时避免后台一次提交把进程内存撑爆
+    contents: list[Annotated[str, Field(max_length=2000)]] = Field(default_factory=list)
+    raw_text: str = Field(default="", max_length=1_000_000)
 
 
 async def _prune_loop(db: Database, interval: float = 3600.0) -> None:
@@ -255,6 +263,14 @@ async def _prune_loop(db: Database, interval: float = 3600.0) -> None:
     """
     while True:
         await asyncio.sleep(interval)
+        usage = rss_mb()
+        if settings.memory_warn_mb and usage >= settings.memory_warn_mb:
+            logger.warning(
+                "进程内存 %.0f MB，已超过警戒线 %s MB；请检查账号数、上传并发或消息保留期",
+                usage, settings.memory_warn_mb,
+            )
+        else:
+            logger.info("进程内存：%.0f MB", usage)
         days = settings.message_retention_days
         if days > 0:
             try:
@@ -318,6 +334,67 @@ def _is_ip_literal(host: str) -> bool:
     return True
 
 
+class _BodyLimitMiddleware:
+    """ASGI 层的请求体上限。
+
+    FastAPI 在进入路由、执行鉴权依赖之前就会读取请求体；如果只在路由里
+    检查上传大小，匿名请求仍可以先塞一个超大 JSON 把内存吃光。这里在
+    最外层按 Content-Length 拒绝，并在流式读取时累计字节，chunked 也拦得住。
+    """
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max(1, max_bytes)
+
+    @property
+    def _detail(self) -> str:
+        return f"请求体太大（上限 {self.max_bytes // 1024 // 1024} MB）"
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                length = int(raw_length)
+            except ValueError:
+                await self._reject(scope, receive, send, 400, "Content-Length 无效")
+                return
+            if length < 0:
+                await self._reject(scope, receive, send, 400, "Content-Length 无效")
+                return
+            if length > self.max_bytes:
+                await self._reject(scope, receive, send, 413, self._detail)
+                return
+
+        received = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    # 抛 HTTPException 让 FastAPI 的异常处理器返回 413，
+                    # 而不是把半截 body 交给路由。
+                    raise HTTPException(status_code=413, detail=self._detail)
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+    @staticmethod
+    async def _reject(
+        scope: dict[str, Any], receive: Any, send: Any, status: int, detail: str
+    ) -> None:
+        response = JSONResponse({"detail": detail}, status_code=status)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+        await response(scope, receive, send)
+
+
 def create_app(db: Database | None = None, manager: WorkerManager | None = None) -> FastAPI:
     database = db or Database(
         settings.db_path,
@@ -336,6 +413,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         # 原因：后台页面每 5 秒轮询一批接口，access log 两小时就能刷满一个 10 MB
         # 文件，真正要看的「保活 / 登录态过期」全被挤进轮转文件里。
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logger.info("进程内存基线：%.0f MB", rss_mb())
         await database.init()
         recovered = await database.recover_stale_sending()
         if recovered:
@@ -345,6 +423,9 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             )
         mgr = manager or WorkerManager(database)
         app.state.manager = mgr
+        # 图片解码 / 视频探测都是「一次吃几十 MB」的操作，必须限制同时进行的数量。
+        # 默认 2（小内存机器自动降为 1），避免几个并发上传把 512 MB 撑爆。
+        app.state.media_slots = asyncio.Semaphore(max(1, settings.media_concurrency))
         await mgr.sync()
         prune_task = asyncio.create_task(_prune_loop(database), name="message-prune")
         try:
@@ -358,7 +439,23 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             await mgr.stop_all()
             await app.state.qr.close()
 
-    app = FastAPI(title="闲鱼自动发货工具", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="闲鱼自动发货工具",
+        version="0.1.0",
+        lifespan=lifespan,
+        # 后台没有第三方 API 使用者，关掉自动生成的文档和 schema：
+        # 少一份可枚举的接口清单，也少三条无鉴权路由。
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    # 32 MB 默认值足够 20 MB 的视频；调大图片/视频上限时要同步调大
+    # XY_MAX_BODY_MB，否则请求会先被这道闸挡掉。
+    # 这是第一道内存闸：在 FastAPI 读 body、跑鉴权依赖之前生效。
+    app.add_middleware(
+        _BodyLimitMiddleware,
+        max_bytes=max(1, settings.max_body_mb) * 1024 * 1024,
+    )
     app.state.db = database
     app.state.qr = QrLoginManager()
 
@@ -371,17 +468,21 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         | {settings.host.lower()}
     )
 
+    def _host_name(raw: str) -> str:
+        """从 Host / Host:port / [IPv6]:port 里取出主机名。"""
+        raw = raw.strip().lower()
+        if raw.startswith("["):
+            return raw.split("]")[0] + "]"
+        if ":" in raw:
+            return raw.split(":")[0]
+        return raw
+
     def _host_ok(request: Request) -> bool:
         raw = (request.headers.get("host") or "").strip().lower()
         if not raw:
             # HTTP/1.0 之类没有 Host：交给后面的鉴权判断，不在这里挡
             return True
-        if raw.startswith("["):
-            host = raw.split("]")[0] + "]"
-        elif ":" in raw:
-            host = raw.split(":")[0]
-        else:
-            host = raw
+        host = _host_name(raw)
         return host in _ALLOWED_HOSTS or _is_ip_literal(host)
 
     @app.middleware("http")
@@ -435,9 +536,29 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     def _qr(request: Request) -> QrLoginManager:
         return request.app.state.qr
 
+    def _is_loopback_host(host: str) -> bool:
+        """只把真正的回环地址/本机名当作本机；127.evil.com 不算。"""
+        name = (host or "").strip().lower()
+        if name in ("localhost", "127.0.0.1", "::1", "[::1]"):
+            return True
+        try:
+            return ipaddress.ip_address(name.strip("[]")).is_loopback
+        except ValueError:
+            return False
+
     def _is_loopback(request: Request) -> bool:
-        host = (request.client.host if request.client else "") or ""
-        return host in ("127.0.0.1", "::1", "localhost") or host.startswith("127.")
+        # 同机反向代理会把 peer 变成 127.0.0.1；只要请求里带代理头，
+        # 就不能再当成「本机直连」，否则没配 XY_ADMIN_TOKEN 时后台会被反代敞开。
+        proxy_headers = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-proto")
+        if any(request.headers.get(name) for name in proxy_headers):
+            return False
+        # 即使反代把代理头全剥掉，只要它保留的是公网域名 Host，
+        # 也不能走「本机无口令」这条兜底；否则配了 XY_ALLOWED_HOSTS
+        # 的反代仍可把远程请求伪装成本机访问。Host 必须也是回环名字/IP。
+        if not _is_loopback_host(_host_name(request.headers.get("host") or "")):
+            return False
+        peer = (request.client.host if request.client else "") or ""
+        return _is_loopback_host(peer)
 
     def _client_ip(request: Request) -> str:
         # 注意：main.py 里 uvicorn 固定 proxy_headers=False，所以这是真实对端，
@@ -468,6 +589,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         chat_media.hit(key)
 
     def _throttle_chat_outbound(request: Request, what: str) -> None:
+        _require_same_origin(request)
         key = f"chat-out:{_client_ip(request)}"
         wait = chat_outbound.blocked_for(key)
         if wait > 0:
@@ -491,6 +613,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
 
     def _throttle_outbound(request: Request, what: str) -> None:
         """限制会触发外部请求的接口，别让面板变成打闲鱼/上游的放大器。"""
+        _require_same_origin(request)
         key = f"{what}:{_client_ip(request)}"
         wait = outbound_calls.blocked_for(key)
         if wait > 0:
@@ -501,19 +624,40 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             )
         outbound_calls.hit(key)
 
+    def _url_host(value: str) -> str:
+        """取 URL 的 host:port；格式不对时返回空串。"""
+        try:
+            return urlsplit(value).netloc.lower()
+        except ValueError:
+            return ""
+
     def _same_origin(request: Request) -> bool:
         """浏览器是不是从「本站」发出的请求。
 
-        只用来挡 CSRF：带 Origin 且和 Host 对不上、或浏览器自己说
-        cross-site，就拒绝。curl 之类没有这两个头，照常能用。
+        只用来挡 CSRF：带 Origin/Referer 且和 Host 对不上、或浏览器自己说
+        cross-site，就拒绝。curl 之类没有这些头，照常能用。
         """
-        if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        site = request.headers.get("sec-fetch-site", "").lower()
+        if site == "cross-site":
             return False
-        origin = request.headers.get("origin")
-        if not origin:
-            return True
         expected_host = (request.headers.get("host") or "").lower()
-        return origin.lower().split("://", 1)[-1] == expected_host
+        origin = request.headers.get("origin") or ""
+        if origin:
+            return _url_host(origin) == expected_host
+        referer = request.headers.get("referer") or ""
+        if referer:
+            return _url_host(referer) == expected_host
+        # 浏览器没给来源信息（curl、老浏览器）时放行；但明确说了
+        # same-site 的请求仍是跨源（例如 evil.example.com -> panel.example.com），
+        # 不能因为「同站」就当成同源。Sec-Fetch-Site: none 是地址栏/书签
+        # 直接打开，攻击者也能用顶层导航触发带副作用的 GET，所以一并拒绝。
+        return site in ("", "same-origin")
+
+    def _require_same_origin(request: Request) -> None:
+        """GET 也可能有副作用（扫码登录、同步聊天、打上游），单独再挡一次。"""
+        if not _same_origin(request):
+            logger.warning("拒绝跨站请求：%s %s", request.method, request.url.path)
+            raise HTTPException(status_code=403, detail="跨站请求被拒绝")
 
     async def require_admin(
         request: Request,
@@ -570,11 +714,27 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     def mgr(request: Request) -> WorkerManager:
         return request.app.state.manager
 
+    def _media_slots() -> asyncio.Semaphore:
+        slots = getattr(app.state, "media_slots", None)
+        if slots is None:
+            # 没走 lifespan 的场景（单测直接调路由）也要能工作
+            slots = asyncio.Semaphore(max(1, settings.media_concurrency))
+            app.state.media_slots = slots
+        return slots
+
+    async def _media_slot():
+        """请求级的上传/图片处理闸门：持有到响应结束才释放。"""
+        async with _media_slots():
+            yield
+
     # -------------------------------------------------------------- 页面
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
-        return HTMLResponse((TEMPLATE_DIR / "index.html").read_text(encoding="utf-8"))
+        global _TEMPLATE_HTML
+        if _TEMPLATE_HTML is None:
+            _TEMPLATE_HTML = (TEMPLATE_DIR / "index.html").read_text(encoding="utf-8")
+        return HTMLResponse(_TEMPLATE_HTML)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -682,6 +842,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     @app.get("/api/login/{session_id}/poll", dependencies=guard)
     async def login_poll(session_id: str, request: Request) -> dict[str, Any]:
         """轮询扫码状态；确认后自动把账号存进数据库并开始监听。"""
+        _require_same_origin(request)
         qr = _qr(request)
         session = qr.get(session_id)
         if session is None:
@@ -774,14 +935,15 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
 
     def _check_reply_payload(payload: ReplyRuleIn, fallback_name: str = "") -> dict[str, Any]:
         """校验并归一化一条规则：entries 里每条都要有内容，关键词规则还要有关键词。"""
+        # 先按条目数拒绝，再 model_dump：避免一个超大 JSON 数组先被逐条展开成 dict
+        if len(payload.entries) > 50:
+            raise HTTPException(status_code=400, detail="一条规则最多配 50 条回复")
         raw: list[dict[str, Any]] = [entry.model_dump() for entry in payload.entries]
         if not raw and (payload.keywords.strip() or payload.content.strip()):
             # 兼容旧接口：没有 entries 时，顶层的 keywords + content 就是唯一一条
             raw = [{"id": None, "keywords": payload.keywords, "content": payload.content}]
         if not raw:
             raise HTTPException(status_code=400, detail="至少要有一条回复内容")
-        if len(raw) > 50:
-            raise HTTPException(status_code=400, detail="一条规则最多配 50 条回复")
 
         entries: list[dict[str, Any]] = []
         for index, entry in enumerate(raw, start=1):
@@ -876,11 +1038,17 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         except XianyuError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            return await client.list_items()
+            items = await client.list_items()
         except CookieExpired as exc:
             raise HTTPException(status_code=400, detail="Cookie 已失效，请重新扫码登录") from exc
         finally:
             await client.close()
+        # 顺手把标题记下来：聊天界面要把「商品 1093…」显示成商品名，
+        # 靠的就是这张 item_titles 表。卖家点一次「拉商品列表」，名字就齐了。
+        await database.remember_item_titles(
+            [(str(item.get("item_id") or ""), str(item.get("title") or "")) for item in items]
+        )
+        return items
 
     # -------------------------------------------------------------- 卡密
 
@@ -899,6 +1067,8 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             contents.extend(line for line in payload.raw_text.splitlines() if line.strip())
         if not contents:
             raise HTTPException(status_code=400, detail="没有可导入的卡密")
+        if len(contents) > 5000:
+            raise HTTPException(status_code=400, detail="一次最多导入 5000 张卡密")
         added = await database.add_cards(contents, payload.item_id)
         return {"added": added}
 
@@ -1347,7 +1517,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     async def list_builtin_images() -> list[dict[str, Any]]:
         return [_builtin_image_out(row) for row in await database.list_builtin_images()]
 
-    @app.post("/api/media/images", dependencies=guard)
+    @app.post("/api/media/images", dependencies=[*guard, Depends(_media_slot)])
     async def upload_builtin_image(
         request: Request,
         file: UploadFile = File(...),
@@ -1391,7 +1561,12 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         path = media_tools.local_media_path(settings.media_dir, "builtin", str(row["filename"]))
         if not path.exists():
             raise HTTPException(status_code=404, detail="图片文件已丢失")
-        return Response(content=path.read_bytes(), media_type=str(row["mime"] or "image/jpeg"))
+        # 不信任数据库里的 mime 字段：旧库/手改库可能把它写成 text/html。
+        # 只按白名单后缀给 MIME，未知后缀强制附件下载。
+        mime = media_tools.image_mime(str(row["filename"]))
+        headers = None if mime else {"Content-Disposition": "attachment"}
+        # FileResponse 按块发送，不会把整张图片读进内存
+        return FileResponse(path, media_type=mime or "application/octet-stream", headers=headers)
 
     @app.delete("/api/media/images/{image_id}", dependencies=guard)
     async def delete_builtin_image(image_id: int) -> dict[str, bool]:
@@ -1468,7 +1643,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "message": message}
 
-    @app.post("/api/chats/{chat_id}/send-image", dependencies=guard)
+    @app.post("/api/chats/{chat_id}/send-image", dependencies=[*guard, Depends(_media_slot)])
     async def send_chat_image(chat_id: str, payload: ChatImageIn, request: Request) -> dict[str, Any]:
         """发送内置图库里的一张图片。"""
         _throttle_chat_media(request, "发送图片")
@@ -1496,7 +1671,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "message": message}
 
-    @app.post("/api/chats/{chat_id}/send-image-file", dependencies=guard)
+    @app.post("/api/chats/{chat_id}/send-image-file", dependencies=[*guard, Depends(_media_slot)])
     async def send_chat_image_file(
         chat_id: str,
         request: Request,
@@ -1527,7 +1702,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "message": message}
 
-    @app.post("/api/chats/{chat_id}/send-video", dependencies=guard)
+    @app.post("/api/chats/{chat_id}/send-video", dependencies=[*guard, Depends(_media_slot)])
     async def send_chat_video(
         chat_id: str,
         request: Request,
@@ -1595,14 +1770,42 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         path = media_tools.local_media_path(settings.media_dir, "chat", filename)
         if not path.exists():
             raise HTTPException(status_code=404, detail="本地媒体文件已丢失")
-        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        return Response(content=path.read_bytes(), media_type=mime)
+        # 只按白名单后缀给 MIME：数据库里的旧记录（甚至被手工改过的记录）
+        # 可能带 .html 之类后缀，绝不能让它以 text/html 在本站渲染。
+        if kind == "poster":
+            inline = Path(filename).suffix.lower() in (".jpg", ".jpeg")
+            mime = "image/jpeg" if inline else "application/octet-stream"
+        else:
+            mime = media_tools.video_mime(filename) or "application/octet-stream"
+            inline = mime.startswith("video/")
+        headers = None if inline else {"Content-Disposition": "attachment"}
+        # 视频动辄几十 MB，FileResponse 走 sendfile，内存占用与文件大小无关
+        return FileResponse(path, media_type=mime, headers=headers)
 
     @app.post("/api/chats/{chat_id}/read", dependencies=guard)
     async def read_chat(chat_id: str, account_id: int = Query(...)) -> dict[str, Any]:
         """把这个会话标成已读（清掉会话列表的红点）。"""
         changed = await database.mark_chat_read(account_id, chat_id)
         return {"ok": True, "read": changed}
+
+    @app.delete("/api/chats/{chat_id}", dependencies=guard)
+    async def delete_chat(
+        chat_id: str,
+        account_id: int = Query(..., description="这个会话属于哪个账号"),
+    ) -> dict[str, Any]:
+        """删除一个会话的后台记录（本地）。
+
+        闲鱼没有「删除会话」接口，所以这里只是把本地流水清掉，
+        换个干净；买家再发消息时会话会正常重新出现。
+        """
+        if not str(chat_id or "").strip():
+            raise HTTPException(status_code=400, detail="缺少会话 ID")
+        try:
+            removed = await database.delete_chat(account_id, chat_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("删除会话 %s（账号 %s）的本地记录：%s", chat_id, account_id, removed)
+        return {"ok": True, **removed}
 
     @app.post("/api/chats/open", dependencies=guard)
     async def open_chat(payload: ChatOpenIn, request: Request) -> dict[str, Any]:
@@ -1699,6 +1902,7 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
             logger.debug("读取站点货币失败，按 USD 展示", exc_info=True)
             currency = "USD"
         _SITE_CURRENCY_CACHE[key] = (time.monotonic(), currency)
+        cap_mapping(_SITE_CURRENCY_CACHE, 32)
         return currency
 
     @app.get("/api/config/settings", dependencies=guard)
@@ -1742,8 +1946,10 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
         }
 
     @app.get("/api/config", dependencies=guard)
-    async def show_config() -> dict[str, Any]:
+    async def show_config(request: Request) -> dict[str, Any]:
         """前端用来提示「上游是否已配好」，不回显任何密钥。"""
+        # 这个接口会按 TTL 访问 new-api 的 /api/status，不能让跨站页面用它打上游。
+        _require_same_origin(request)
         limits = await _model_limits_state()
         auto_rate = await _auto_rate_state()
         return {

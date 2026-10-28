@@ -219,6 +219,12 @@ select.in{appearance:none;background-image:linear-gradient(45deg,transparent 50%
   text-overflow:ellipsis;margin-top:3px}
 .chat-badge{display:inline-grid;place-items:center;min-width:17px;height:17px;padding:0 5px;
   border-radius:999px;background:var(--acc);color:#fff;font-size:10.5px;font-weight:650;flex:none}
+/* 删除按钮只在鼠标划到这一行时露出来：平时列表要干净，误点也不容易点到 */
+.chat-item .ci-del{flex:none;display:grid;place-items:center;width:18px;height:18px;padding:0;
+  border:none;border-radius:6px;background:transparent;color:var(--muted);font:inherit;
+  font-size:14px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s,background .12s,color .12s}
+.chat-item:hover .ci-del,.chat-item .ci-del:focus-visible{opacity:1}
+.chat-item .ci-del:hover{background:var(--err-soft);color:var(--err)}
 .chat-main{display:flex;flex-direction:column;min-height:calc(100vh - 190px)}
 .chat-head-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px}
 .chat-body{flex:1;min-height:340px;max-height:calc(100vh - 340px);overflow-y:auto;padding:18px;
@@ -417,14 +423,6 @@ td.entries-cell > b{display:inline-block;max-width:190px;overflow:hidden;text-ov
       <a class="nav-item" data-view="rules" href="#rules">
         <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2.2"/><circle cx="10" cy="17" r="2.2"/></svg>
         <span>发货规则</span>
-      </a>
-      <a class="nav-item" data-view="buyerkeys" href="#buyerkeys">
-        <svg viewBox="0 0 24 24"><path d="M14.5 6.5a4 4 0 0 0-5.4 5.4L4 17v3h3l5.1-5.1a4 4 0 0 0 5.4-5.4l-2.4 2.4-2.3-2.3z"/></svg>
-        <span>买家 Key</span>
-      </a>
-      <a class="nav-item" data-view="buyeraccounts" href="#buyeraccounts">
-        <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c.5-3.4 3-5.4 6-5.4s5.5 2 6 5.4"/><path d="M16 9h5M18.5 6.5v5"/></svg>
-        <span>买家账号</span>
       </a>
       <a class="nav-item" data-view="replies" href="#replies">
         <svg viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 0 1-12.4 7.5L3.5 21l1.6-4.4A8.5 8.5 0 1 1 20.5 12z"/><path d="M8.5 9.5h7M8.5 13h4.5"/></svg>
@@ -642,96 +640,6 @@ td.entries-cell > b{display:inline-block;max-width:190px;overflow:hidden;text-ov
           <div class="card-b tight tw"><table>
             <thead><tr><th>规则</th><th>商品</th><th>模式</th><th>额度策略</th><th>自动确认</th><th>状态</th><th></th></tr></thead>
             <tbody id="rules"></tbody>
-          </table></div>
-        </div>
-      </section>
-
-      <!-- ============ 买家 Key ============ -->
-      <section class="view" id="view-buyerkeys">
-        <div id="buyerkeys-banner" style="margin-bottom:16px"></div>
-        <div class="card">
-          <div class="card-h">
-            <div><h2>绑定买家 Key</h2>
-              <p class="sub">「充值到已有 Key」模式会把额度充到这里绑定的 Key 上，不再换 Key</p></div>
-          </div>
-          <div class="card-b">
-            <div class="form-grid">
-              <label class="field"><span class="lbl">买家 ID（闲鱼用户 ID）</span>
-                <input class="in" id="bk-buyer" placeholder="例如 4100000001" /></label>
-              <label class="field"><span class="lbl">买家昵称（可选）</span>
-                <input class="in" id="bk-name" placeholder="只用于后台展示" /></label>
-            </div>
-            <div class="form-grid">
-              <label class="field"><span class="lbl">令牌 ID（推荐）</span>
-                <input class="in" id="bk-token" placeholder="new-api 后台「令牌」里那条的 id" /></label>
-              <div class="field"><span class="lbl">从 new-api 令牌列表选</span>
-                <div style="display:flex;gap:6px">
-                  <select class="in" id="bk-token-pick" onchange="pickNewApiToken(this.value)">
-                    <option value="">— 点「刷新」拉列表 —</option>
-                  </select>
-                  <button class="btn" onclick="loadNewApiTokens()" style="flex:none">刷新</button>
-                </div></div>
-            </div>
-            <label class="field"><span class="lbl">或者直接粘贴 Key（会自动反查令牌）</span>
-              <input class="in" id="bk-key" placeholder="sk-..." /></label>
-            <label class="field"><span class="lbl">备注</span>
-              <input class="in" id="bk-remark" placeholder="例如：老客户，用回 9 月那个 Key" /></label>
-            <div class="row" style="margin-top:14px;gap:10px">
-              <button class="btn primary" onclick="bindBuyerKey()">保存绑定</button>
-              <button class="btn" onclick="resetBuyerKeyForm()">清空</button>
-              <span class="tiny muted">令牌 ID 和 Key 至少填一个；后台手工绑定的 Key 不会被自动绑定覆盖。</span>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-h">
-            <div><h2>已绑定的买家 Key</h2><p class="sub" id="bk-count">—</p></div>
-          </div>
-          <div class="card-b tight tw"><table>
-            <thead><tr><th>买家</th><th>Key</th><th>令牌</th><th>余额</th><th>累计额度</th><th>来源</th><th>备注</th><th></th></tr></thead>
-            <tbody id="buyer-keys"></tbody>
-          </table></div>
-        </div>
-      </section>
-
-      <!-- ============ 买家账号 ============ -->
-      <section class="view" id="view-buyeraccounts">
-        <div id="buyeraccounts-banner" style="margin-bottom:16px"></div>
-        <div class="card">
-          <div class="card-h">
-            <div><h2>绑定买家账号</h2>
-              <p class="sub">账号模式：老用户的额度就充到这里绑定的 new-api 账号上；新用户的账号由机器人开号时自动绑定</p></div>
-          </div>
-          <div class="card-b">
-            <div class="form-grid">
-              <label class="field"><span class="lbl">买家 ID（闲鱼用户 ID）</span>
-                <input class="in" id="ba-buyer" placeholder="例如 4100000001" /></label>
-              <label class="field"><span class="lbl">买家昵称（可选）</span>
-                <input class="in" id="ba-name" placeholder="只用于后台展示" /></label>
-            </div>
-            <div class="form-grid">
-              <label class="field"><span class="lbl">new-api 账号名</span>
-                <input class="in" id="ba-username" placeholder="例如 lumorian" oninput="scheduleAccountLookup()" /></label>
-              <label class="field"><span class="lbl">账号 ID（推荐，填了按 id 绑）</span>
-                <input class="in" id="ba-userid" placeholder="new-api 用户列表里的 id" /></label>
-            </div>
-            <div class="tiny muted" id="ba-lookup" style="margin:2px 0 6px"></div>
-            <label class="field"><span class="lbl">备注</span>
-              <input class="in" id="ba-remark" placeholder="例如：老客户自己的号" /></label>
-            <div class="row" style="margin-top:14px;gap:10px">
-              <button class="btn primary" onclick="bindBuyerAccount()">保存绑定</button>
-              <button class="btn" onclick="resetBuyerAccountForm()">清空</button>
-              <span class="tiny muted">绑定后这个买家下次下单会直接充到该账号，不再询问。</span>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-h">
-            <div><h2>已绑定的买家账号</h2><p class="sub" id="ba-count">—</p></div>
-          </div>
-          <div class="card-b tight tw"><table>
-            <thead><tr><th>买家</th><th>账号</th><th>余额</th><th>累计额度</th><th>次数</th><th>来源</th><th>备注</th><th></th></tr></thead>
-            <tbody id="buyer-accounts"></tbody>
           </table></div>
         </div>
       </section>
@@ -983,13 +891,15 @@ td.entries-cell > b{display:inline-block;max-width:190px;overflow:hidden;text-ov
         <label class="field"><span class="lbl">发货模式</span>
           <select class="in" id="rule-mode" onchange="onRuleModeChange()">
             <option value="redeem">兑换码（new-api 兑换码，买家自己登录兑换）</option>
-            <option value="account">账号模式（有账号就充值，没有就开新号发卡密）</option>
-            <option value="topup">充值到买家已有 Key（不换 Key）</option>
             <option value="upstream">按订单金额建新 Key（出卡密）</option>
             <option value="card">本地卡密池</option>
             <option value="text">固定文案</option>
-          </select></label>
+          </select>
+          <span class="hint">「账号模式」和「充值到买家已有 Key」已经下线，新建规则选不到了；
+            以前建的老规则仍然照原样跑，点进来还能看到并修改。</span></label>
       </div>
+      <!-- 打开老规则（账号模式 / 充值模式）时才会露出来的提示条 -->
+      <div class="banner" id="rule-legacy-note" style="display:none"></div>
       <div class="form-grid">
         <label class="field"><span class="lbl">商品 ID</span>
           <input class="in" id="rule-item" placeholder="* 表示全部商品" value="*" oninput="onRuleMeta()" /></label>
@@ -1236,7 +1146,7 @@ var TOKEN = readToken();
   } catch (e) { /* 老浏览器没有 replaceState：忽略 */ }
 })();
 var S = { accounts: [], status: [], rules: [], replyRules: [], cards: [], stock: [], orders: [],
-          messages: [], chats: [], itemModels: [], rateRecords: [], buyerKeys: [], cfg: null };
+          messages: [], chats: [], itemModels: [], rateRecords: [], cfg: null };
 var QR_TIMER = null, QR_SID = null, ITEM_PRICES = {}, EDIT_ID = null, TICK = 0;
 var REPLY_EDIT_ID = null, ITEM_MODEL_EDIT_ID = null;
 /* 自动回复弹窗里的条目：{ id, keywords, content }。渲染前先从 DOM 同步，避免重绘丢字。 */
@@ -1251,14 +1161,15 @@ var RULE_ACCOUNT_OLD_DEFAULT = "你好 {buyer}，已给账号 {username} 充值 
 var CHAT_SEL = null, CHAT_MESSAGES = [], CHAT_LOADING = false, CHAT_SENDING = false;
 var MEDIA_IMAGES = [], MEDIA_BLOB_CACHE = {};
 
-var VIEWS = ["overview", "chat", "accounts", "rules", "buyerkeys", "buyeraccounts", "replies", "orders", "cards", "messages", "settings"];
+/* 「买家 Key」「买家账号」两个页面跟着它们对应的发货模式一起下线了：
+   绑定改由机器人自动完成（首单开号 / 历史订单回溯），老规则照样跑，
+   后台接口 GET/POST /api/buyer-keys、/api/buyer-accounts 仍然留着，只是不再有页面。 */
+var VIEWS = ["overview", "chat", "accounts", "rules", "replies", "orders", "cards", "messages", "settings"];
 var TITLES = {
   overview: ["总览", "运行状况一眼看完"],
   chat: ["聊天", "像微信一样直接在后台回复买家私信"],
   accounts: ["账号", "登录闲鱼账号，管理长连接"],
   rules: ["发货规则", "一条规则决定什么商品发什么内容"],
-  buyerkeys: ["买家 Key", "充值模式充到哪个 Key，在这里绑定"],
-  buyeraccounts: ["买家账号", "账号模式充到哪个账号，在这里绑定"],
   replies: ["自动回复", "商品 / 关键词命中就自动回一条私信"],
   orders: ["发货记录", "每一单的结果都在这里"],
   cards: ["卡密池", "本地卡密的进口与出库"],
@@ -1501,6 +1412,10 @@ function openRule(id) {
   }
   document.getElementById("rule-modal-title").textContent = r ? "编辑规则" : "新建规则";
   document.getElementById("rule-name").value = r ? r.name : "";
+  // 账号 / 充值两种模式已经下架，只有老规则才会临时补一个「已下线」选项，
+  // 不然下拉框设不进这个值，一保存就被悄悄改成别的模式。
+  dropLegacyModeOptions();
+  if (r && isLegacyMode(r.mode)) ensureLegacyModeOption(r.mode);
   document.getElementById("rule-mode").value = r ? r.mode : "redeem";
   document.getElementById("rule-item").value = r ? r.item_id : "*";
   document.getElementById("rule-priority").value = r ? r.priority : 0;
@@ -1532,6 +1447,27 @@ function closeRule() {
   document.getElementById("rule-modal").classList.remove("open");
   EDIT_ID = null;
 }
+// 已经下线的发货模式：还能在库里跑到，但新规则不能再选
+function isLegacyMode(mode) {
+  return mode === "account" || mode === "topup";
+}
+function ensureLegacyModeOption(mode) {
+  var sel = document.getElementById("rule-mode");
+  for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === mode) return;
+  var opt = document.createElement("option");
+  opt.value = mode;
+  opt.dataset.legacy = "1";
+  opt.textContent = mode === "account"
+    ? "账号模式（已下线，仅老规则保留）"
+    : "充值到买家已有 Key（已下线，仅老规则保留）";
+  sel.appendChild(opt);
+}
+function dropLegacyModeOptions() {
+  var sel = document.getElementById("rule-mode");
+  for (var i = sel.options.length - 1; i >= 0; i--) {
+    if (sel.options[i].dataset && sel.options[i].dataset.legacy) sel.remove(i);
+  }
+}
 function onRuleModeChange() {
   var mode = document.getElementById("rule-mode").value;
   var box = document.getElementById("rule-content");
@@ -1551,6 +1487,16 @@ function onRuleMeta() {
   var mode = document.getElementById("rule-mode").value;
   var usesQuota = mode === "upstream" || mode === "topup" || mode === "account"
     || mode === "redeem";
+  // 老规则打开时给一条明显的说明，免得以为新规则也能这么选
+  var legacyNote = document.getElementById("rule-legacy-note");
+  if (legacyNote) {
+    legacyNote.style.display = isLegacyMode(mode) ? "" : "none";
+    legacyNote.textContent = isLegacyMode(mode)
+      ? "这条规则用的是已经下线的「" + (mode === "account" ? "账号模式" : "充值到买家已有 Key")
+        + "」。下面的字段还能改，保存后照旧生效；但新建规则已经选不到这个模式了，"
+        + "想要新玩法请新开一条「建新 Key」或「兑换码」规则。"
+      : "";
+  }
   document.getElementById("rule-upstream-fields").style.display = usesQuota ? "grid" : "none";
   document.getElementById("rule-redeem-fields").style.display =
     mode === "redeem" ? "grid" : "none";
@@ -1693,217 +1639,6 @@ async function removeRule(id) {
   try { await api("/api/rules/" + id, { method: "DELETE" }); refresh(true); }
   catch (e) { toast(e.message, true); }
 }
-
-/* ---------- 买家 Key（充值模式） ---------- */
-function buyerKeySourceLabel(src) {
-  var map = { manual: "手工绑定", order: "首单 / 自动", history: "历史订单回溯" };
-  return map[src] || src || "—";
-}
-function renderBuyerKeys() {
-  var banner = document.getElementById("buyerkeys-banner");
-  if (S.cfg && !S.cfg.newapi_ready) {
-    banner.innerHTML = "<div class='banner warn'><span class='ic'>⚠️</span><div>" +
-      "<b>new-api 未配置</b> —— 绑定和充值都要打 new-api，先把 <code>.env</code> 里的 " +
-      "<code>XY_NEWAPI_*</code> 配好。</div></div>";
-  } else {
-    banner.innerHTML = "<div class='banner ok'><span class='ic'>🔑</span><div>" +
-      "买家<b>第一次</b>在充值模式下购买时，会自动开一个 Key 并绑定；" +
-      "老客户会用他最近一单收到的那个 Key。<b>后台手工绑定的不会被自动覆盖。</b></div></div>";
-  }
-  var rows = S.buyerKeys || [];
-  document.getElementById("bk-count").textContent = rows.length
-    ? "共 " + rows.length + " 个买家已绑定" : "还没有绑定 — 买家首单会自动绑定，也可以在上面手工指定";
-  document.getElementById("buyer-keys").innerHTML = rows.length ? rows.map(function (k) {
-    var balance = k.balance == null ? "—" : quotaUnit() + Number(k.balance).toFixed(2);
-    var total = Number(k.topup_count || 0)
-      ? Number(k.topup_count) + " 次 / " + quotaUnit() + Number(k.total_usd || 0).toFixed(2)
-      : "—";
-    return "<tr><td><b>" + esc(k.buyer_name || "买家") + "</b>" +
-      "<div class='tiny muted'><code>" + esc(k.buyer_id) + "</code></div></td>" +
-      "<td><code>" + esc(k.key_mask || "—") + "</code>" +
-      (k.has_key ? "" : "<div class='tiny muted'>还没读到明文 Key</div>") + "</td>" +
-      "<td class='tiny muted'>" + (k.token_name ? esc(k.token_name) + "<br>" : "") +
-      "<code>" + esc(k.token_id || "—") + "</code></td>" +
-      "<td class='num'>" + balance + "</td>" +
-      "<td class='num tiny'>" + total + "</td>" +
-      "<td class='tiny'>" + esc(buyerKeySourceLabel(k.source)) + "</td>" +
-      "<td class='tiny muted'>" + esc(k.remark || "—") + "</td>" +
-      "<td class='actions'><button class='link' onclick='refreshBuyerKey(" + Number(k.id) + ")'>刷新余额</button>" +
-      "<button class='link danger' onclick='removeBuyerKey(" + Number(k.id) + ")'>解绑</button></td></tr>";
-  }).join("") : emptyRow(8, "还没有买家绑定 Key", "🔑");
-}
-function prefillBuyerKey(buyerId, buyerName) {
-  location.hash = "#buyerkeys";
-  document.getElementById("bk-buyer").value = buyerId || "";
-  document.getElementById("bk-name").value = buyerName || "";
-  toast("已填入买家 ID，接着填令牌 ID 或 Key");
-  setTimeout(function () { document.getElementById("bk-token").focus(); }, 120);
-}
-function resetBuyerKeyForm() {
-  document.getElementById("bk-buyer").value = "";
-  document.getElementById("bk-name").value = "";
-  document.getElementById("bk-token").value = "";
-  document.getElementById("bk-key").value = "";
-  document.getElementById("bk-remark").value = "";
-  document.getElementById("bk-token-pick").value = "";
-}
-async function bindBuyerKey() {
-  var buyer = document.getElementById("bk-buyer").value.trim();
-  if (!buyer) { toast("先填买家 ID（闲鱼用户 ID）", true); return; }
-  var body = JSON.stringify({
-    buyer_id: buyer,
-    buyer_name: document.getElementById("bk-name").value.trim(),
-    token_id: document.getElementById("bk-token").value.trim(),
-    api_key: document.getElementById("bk-key").value.trim(),
-    remark: document.getElementById("bk-remark").value.trim()
-  });
-  try {
-    var r = await api("/api/buyer-keys", { method: "POST", body: body });
-    toast("已绑定" + (r.balance == null ? "" : "，当前余额 " + quotaUnit() + Number(r.balance).toFixed(2)));
-    resetBuyerKeyForm();
-    refresh(true);
-  } catch (e) { toast(e.message, true); }
-}
-async function removeBuyerKey(id) {
-  if (!confirm("解绑后这个买家再下单会重新开新 Key，确定吗？")) return;
-  try { await api("/api/buyer-keys/" + id, { method: "DELETE" }); refresh(true); }
-  catch (e) { toast(e.message, true); }
-}
-async function refreshBuyerKey(id) {
-  try {
-    var r = await api("/api/buyer-keys/" + id + "/refresh", { method: "POST" });
-    toast("余额已刷新" + (r.balance == null ? "" : "：" + quotaUnit() + Number(r.balance).toFixed(2)));
-    refresh(true);
-  } catch (e) { toast(e.message, true); }
-}
-
-/* ---------- 买家账号（账号模式） ---------- */
-function buyerAccountSourceLabel(src) {
-  var map = { manual: "手工绑定", order: "开号 / 下单时绑定" };
-  return map[src] || src || "—";
-}
-function renderBuyerAccounts() {
-  var banner = document.getElementById("buyeraccounts-banner");
-  if (S.cfg && !S.cfg.newapi_ready) {
-    banner.innerHTML = "<div class='banner warn'><span class='ic'>⚠️</span><div>" +
-      "<b>new-api 未配置</b> —— 开号和充值都要打 new-api，先把 <code>.env</code> 里的 " +
-      "<code>XY_NEWAPI_*</code> 配好。</div></div>";
-  } else {
-    banner.innerHTML = "<div class='banner ok'><span class='ic'>👤</span><div>" +
-      "账号模式：新用户由机器人开号（账号名买家自己定，密码随机生成），" +
-      "账号密码会灌进一张卡密让买家到卡密站兑换；<b>老用户先回显账号和余额，回「确认」才充值</b>。" +
-      "</div></div>";
-  }
-  var rows = S.buyerAccounts || [];
-  document.getElementById("ba-count").textContent = rows.length
-    ? "共 " + rows.length + " 个买家已绑定账号" : "还没有绑定 — 新用户开号时会自动绑定，也可以在上面手工指定";
-  document.getElementById("buyer-accounts").innerHTML = rows.length ? rows.map(function (a) {
-    var balance = a.balance == null ? "—" : quotaUnit() + Number(a.balance).toFixed(2);
-    var total = Number(a.topup_count || 0)
-      ? quotaUnit() + Number(a.total_usd || 0).toFixed(2) : "—";
-    return "<tr><td><b>" + esc(a.buyer_name || "买家") + "</b>" +
-      "<div class='tiny muted'><code>" + esc(a.buyer_id) + "</code></div></td>" +
-      "<td><b>" + esc(a.username || "—") + "</b>" +
-      "<div class='tiny muted'><code>" + esc(a.user_id || "—") + "</code></div></td>" +
-      "<td class='num'>" + balance + "</td>" +
-      "<td class='num tiny'>" + total + "</td>" +
-      "<td class='num tiny'>" + Number(a.topup_count || 0) + "</td>" +
-      "<td class='tiny'>" + esc(buyerAccountSourceLabel(a.source)) + "</td>" +
-      "<td class='tiny muted'>" + esc(a.remark || "—") + "</td>" +
-      "<td class='actions'>" +
-      "<button class='link' onclick='refreshBuyerAccount(" + Number(a.id) + ")'>刷新余额</button>" +
-      (a.has_password
-        ? "<button class='link' onclick='copyBuyerAccountPassword(" + Number(a.id) + ")'>复制密码</button>"
-        : "") +
-      "<button class='link danger' onclick='removeBuyerAccount(" + Number(a.id) + ")'>解绑</button></td></tr>";
-  }).join("") : emptyRow(8, "还没有买家绑定账号", "👤");
-}
-function resetBuyerAccountForm() {
-  document.getElementById("ba-buyer").value = "";
-  document.getElementById("ba-name").value = "";
-  document.getElementById("ba-username").value = "";
-  document.getElementById("ba-userid").value = "";
-  document.getElementById("ba-remark").value = "";
-  document.getElementById("ba-lookup").textContent = "";
-}
-var BA_LOOKUP_TIMER = null;
-function scheduleAccountLookup() {
-  if (BA_LOOKUP_TIMER) clearTimeout(BA_LOOKUP_TIMER);
-  BA_LOOKUP_TIMER = setTimeout(lookupAccountUser, 400);
-}
-async function lookupAccountUser() {
-  var name = document.getElementById("ba-username").value.trim();
-  var el = document.getElementById("ba-lookup");
-  if (!name) { el.textContent = ""; return; }
-  try {
-    var rows = await api("/api/newapi/users?username=" + encodeURIComponent(name));
-    if (!rows.length) { el.textContent = "new-api 里没有这个账号"; return; }
-    el.textContent = "找到账号 id " + rows[0].user_id +
-      "，当前余额 " + quotaUnit() + Number(rows[0].balance || 0).toFixed(2);
-    document.getElementById("ba-userid").value = rows[0].user_id;
-  } catch (e) { el.textContent = "查账号失败：" + e.message; }
-}
-async function bindBuyerAccount() {
-  var buyer = document.getElementById("ba-buyer").value.trim();
-  if (!buyer) { toast("先填买家 ID（闲鱼用户 ID）", true); return; }
-  var body = JSON.stringify({
-    buyer_id: buyer,
-    buyer_name: document.getElementById("ba-name").value.trim(),
-    username: document.getElementById("ba-username").value.trim(),
-    user_id: document.getElementById("ba-userid").value.trim(),
-    remark: document.getElementById("ba-remark").value.trim()
-  });
-  try {
-    var r = await api("/api/buyer-accounts", { method: "POST", body: body });
-    toast("已绑定账号 " + (r.username || "") +
-      (r.balance == null ? "" : "，当前余额 " + quotaUnit() + Number(r.balance).toFixed(2)));
-    resetBuyerAccountForm();
-    refresh(true);
-  } catch (e) { toast(e.message, true); }
-}
-async function removeBuyerAccount(id) {
-  if (!confirm("解绑后这个买家再下单会重新问「有没有账号」，确定吗？")) return;
-  try { await api("/api/buyer-accounts/" + id, { method: "DELETE" }); refresh(true); }
-  catch (e) { toast(e.message, true); }
-}
-async function refreshBuyerAccount(id) {
-  try {
-    var r = await api("/api/buyer-accounts/" + id + "/refresh", { method: "POST" });
-    toast("余额已刷新" + (r.balance == null ? "" : "：" + quotaUnit() + Number(r.balance).toFixed(2)));
-    refresh(true);
-  } catch (e) { toast(e.message, true); }
-}
-async function copyBuyerAccountPassword(id) {
-  // 买家把卡密弄丢时，客服在这里取回原样再发一次。
-  // new-api 的重置密码接口要 2FA 验证码，机器人拿不到，所以密码只能靠这里留底。
-  try {
-    var s = await api("/api/buyer-accounts/" + id + "/secret");
-    var text = "账号：" + (s.username || "") + "\n密码：" + (s.password || "（没留下）");
-    if (s.card_code) text += "\n卡密：" + s.card_code;
-    try {
-      await navigator.clipboard.writeText(text);
-      toast("账号密码已复制到剪贴板");
-    } catch (e) {
-      window.prompt("复制下面的账号密码发给买家", text);
-    }
-  } catch (e) { toast(e.message, true); }
-}
-
-async function loadNewApiTokens() {
-  var sel = document.getElementById("bk-token-pick");
-  try {
-    var items = await api("/api/newapi/tokens?limit=100");
-    sel.innerHTML = '<option value="">— 从 new-api 令牌里选 —</option>' + items.map(function (t) {
-      var label = (t.name || "未命名") + " · id " + t.id + (t.unlimited_quota ? " · 不限额度" : "");
-      return '<option value="' + esc(t.id) + '">' + esc(label) + "</option>";
-    }).join("");
-    toast(items.length ? "拉到 " + items.length + " 个令牌" : "令牌列表是空的");
-  } catch (e) { toast(e.message, true); }
-}
-function pickNewApiToken(v) {
-  if (v) document.getElementById("bk-token").value = v;
-}
-
 
 /* ---------- 自动回复 ---------- */
 var REPLY_SAMPLE = { buyer: "小明", item_id: "900052644277", order_id: "2500000000000000001",
@@ -2541,6 +2276,8 @@ function renderRules() {
       : r.mode === "topup" ? "充值已有 Key"
       : r.mode === "upstream" ? "建新 Key"
       : r.mode === "card" ? "本地卡密池" : "固定文案";
+    // 下线的模式在列表里明确标出来：看是能看见，但别再照着新建了
+    if (isLegacyMode(r.mode)) modeName += "（已下线）";
     var modeCls = usesQuota ? "info" : "plain";
     return "<tr><td><b>" + esc(r.name) + "</b></td>" +
       "<td><code>" + esc(r.item_id) + "</code>" + specInfo + "</td>" +
@@ -2574,8 +2311,6 @@ function renderOrders() {
     if (o.buyer_id) {
       chatCell += "<button class='link' onclick='openOrderChatForRow(" +
         Number(o.id) + ")'>聊天</button>";
-      chatCell += "<button class='link' onclick='prefillBuyerKey(" +
-        jsArg(o.buyer_id) + "," + jsArg(o.buyer_name || "") + ")'>绑定 Key</button>";
     } else {
       chatCell += "<span class='muted tiny'>—</span>";
     }
@@ -2702,16 +2437,23 @@ function renderChatList() {
     if (c.kind === "outgoing") preview = "我：" + preview;
     if (preview.length > 40) preview = preview.slice(0, 40) + "…";
     var sub = chatAccountName(c.account_id);
-    if (c.item_id) sub += " · 商品 " + c.item_id;
+    // 商品名优先：后端会从历史消息 / 商品列表里把标题补进 item_titles，
+    // 老数据没有标题才退回显示商品 ID，免得这里出现一片空白
+    var itemLabel = c.item_title || c.item_id;
+    if (itemLabel) sub += " · 商品 " + itemLabel;
     else if (c.order_id) sub += " · 订单 " + c.order_id;
     var initial = String(name).slice(0, 1) || "?";
     var badge = Number(c.unread) > 0 ? "<span class='chat-badge'>" + Number(c.unread) + "</span>" : "";
+    // 删除必须 stopPropagation，否则点一下先选中会话再弹删除框
+    var del = "<button class='ci-del' title='删除这个会话的本地记录' aria-label='删除会话'" +
+      " onclick='event.stopPropagation(); deleteChatItem(" + Number(c.account_id) + ","
+      + jsArg(c.chat_id) + ")'>×</button>";
     return "<div class='chat-item" + (active ? " active" : "") + "'" +
       " onclick='selectChat(" + Number(c.account_id) + "," + jsArg(c.chat_id) + ")'>" +
       "<div class='ava'>" + esc(initial) + "</div>" +
       "<div class='ci-main'>" +
         "<div class='ci-top'><span class='ci-name'>" + esc(name) + "</span>" +
-          "<span class='ci-time'>" + esc(chatTime(c.created_at)) + "</span>" + badge + "</div>" +
+          "<span class='ci-time'>" + esc(chatTime(c.created_at)) + "</span>" + badge + del + "</div>" +
         "<div class='ci-sub'>" + esc(sub) + "</div>" +
         "<div class='ci-preview'>" + esc(preview || "（空消息）") + "</div>" +
       "</div></div>";
@@ -2770,7 +2512,13 @@ function renderChatPanel(forceScroll) {
   title.textContent = CHAT_SEL.buyer_name || CHAT_SEL.buyer_id || CHAT_SEL.chat_id;
   var bits = [];
   bits.push("<span class='pill info'><span class='dot'></span>" + esc(chatAccountName(CHAT_SEL.account_id)) + "</span>");
-  if (CHAT_SEL.item_id) bits.push("<span class='pill plain'><span class='dot'></span>商品 " + esc(CHAT_SEL.item_id) + "</span>");
+  // 头部同样优先显示商品名，商品 ID 塞进 title 里，鼠标停一下还能看到
+  var itemLabel = CHAT_SEL.item_title || CHAT_SEL.item_id;
+  if (itemLabel) {
+    bits.push("<span class='pill plain'" +
+      (CHAT_SEL.item_id ? " title='商品 ID " + esc(CHAT_SEL.item_id) + "'" : "") +
+      "><span class='dot'></span>商品 " + esc(itemLabel) + "</span>");
+  }
   if (CHAT_SEL.order_id) bits.push("<span class='pill plain'><span class='dot'></span>订单 " + esc(CHAT_SEL.order_id) + "</span>");
   meta.innerHTML = bits.join("");
   if (compose) compose.style.display = "block";
@@ -2815,8 +2563,10 @@ function renderChatPanel(forceScroll) {
   if (forceScroll || prevBottom) body.scrollTop = body.scrollHeight;
 }
 function viewChatImage(img) {
-  if (!img || !img.src) return;
-  window.open(img.src, "_blank", "noopener");
+  if (!img) return;
+  var src = safeMediaUrl(img.src);
+  if (!src) return;
+  window.open(src, "_blank", "noopener");
 }
 
 function maybeAutoOpenChat() {
@@ -2843,6 +2593,7 @@ function selectChat(accountId, chatId, sync) {
     buyer_id: (c && (c.buyer_id || c.sender_id)) || (same && CHAT_SEL.buyer_id) || "",
     buyer_name: (c && c.sender_name) || (same && CHAT_SEL.buyer_name) || "",
     item_id: (c && c.item_id) || (same && CHAT_SEL.item_id) || "",
+    item_title: (c && c.item_title) || (same && CHAT_SEL.item_title) || "",
     order_id: (c && c.order_id) || (same && CHAT_SEL.order_id) || ""
   };
   if (c) c.unread = 0;
@@ -2850,6 +2601,35 @@ function selectChat(accountId, chatId, sync) {
   renderNotifyBadges();   // 打开会话就等于读过：角标 / 标题立刻跟着变
   renderChatPanel(true);
   loadChatMessages(sync !== false, true);
+}
+function forgetChatLocal(accountId, chatId) {
+  // 后端记录已经删掉了，前端把这一行从列表里摘掉；如果正开着这个会话，就把右侧清空
+  S.chats = S.chats.filter(function (c) {
+    return !(String(c.account_id) === String(accountId) && String(c.chat_id) === String(chatId));
+  });
+  if (CHAT_SEL && String(CHAT_SEL.account_id) === String(accountId)
+      && String(CHAT_SEL.chat_id) === String(chatId)) {
+    CHAT_SEL = null;
+    CHAT_MESSAGES = [];
+  }
+  renderChatList();
+  renderNotifyBadges();
+  renderChatPanel(true);
+}
+async function deleteChatItem(accountId, chatId) {
+  // 只删本地记录：闲鱼没有「删会话」的接口，长连接里也没有这个操作，
+  // 所以这里的删除 = 清掉后台库里的聊天记录，闲鱼上的对话不受影响。
+  var c = chatOf(accountId, chatId);
+  var who = (c && (c.sender_name || c.buyer_id)) || chatId;
+  if (!confirm("删除和「" + who + "」的本地聊天记录？\n\n" +
+      "只删这个后台里的消息记录，闲鱼上的对话不会消失；" +
+      "对方之后再发消息，这个会话会重新出现。")) return;
+  try {
+    var r = await api("/api/chats/" + encodeURIComponent(chatId)
+      + "?account_id=" + encodeURIComponent(accountId), { method: "DELETE" });
+    forgetChatLocal(accountId, chatId);
+    toast("已删除本地聊天记录" + (r && r.messages ? "（" + r.messages + " 条消息）" : ""));
+  } catch (e) { toast(e.message, true); }
 }
 async function markChatRead() {
   if (!CHAT_SEL) return;
@@ -2875,6 +2655,7 @@ async function loadChatMessages(sync, keepScroll) {
       CHAT_SEL.buyer_id = r.chat.buyer_id || CHAT_SEL.buyer_id;
       CHAT_SEL.buyer_name = r.chat.sender_name || CHAT_SEL.buyer_name;
       CHAT_SEL.item_id = r.chat.item_id || CHAT_SEL.item_id;
+      CHAT_SEL.item_title = r.chat.item_title || CHAT_SEL.item_title;
       CHAT_SEL.order_id = r.chat.order_id || CHAT_SEL.order_id;
       var c = chatOf(sel.account_id, sel.chat_id);
       if (c) { c.unread = Number(r.chat.unread) || 0; }
@@ -2927,6 +2708,7 @@ async function sendChat() {
         account_id: CHAT_SEL.account_id, chat_id: CHAT_SEL.chat_id,
         sender_id: CHAT_SEL.buyer_id, sender_name: CHAT_SEL.buyer_name,
         buyer_id: CHAT_SEL.buyer_id, item_id: CHAT_SEL.item_id || null,
+        item_title: CHAT_SEL.item_title || null,
         order_id: CHAT_SEL.order_id || null, unread: 0
       };
       S.chats.unshift(c);
@@ -2981,6 +2763,7 @@ async function openOrderChat(o) {
       buyer_id: r.buyer_id,
       buyer_name: r.buyer_name || (r.chat && r.chat.sender_name) || "",
       item_id: r.item_id || (r.chat && r.chat.item_id) || "",
+      item_title: r.item_title || (r.chat && r.chat.item_title) || "",
       order_id: r.order_id || (r.chat && r.chat.order_id) || ""
     };
     if (!chatOf(CHAT_SEL.account_id, CHAT_SEL.chat_id)) {
@@ -2989,6 +2772,7 @@ async function openOrderChat(o) {
         account_id: CHAT_SEL.account_id, chat_id: CHAT_SEL.chat_id,
         sender_id: CHAT_SEL.buyer_id, sender_name: CHAT_SEL.buyer_name,
         buyer_id: CHAT_SEL.buyer_id, item_id: CHAT_SEL.item_id || null,
+        item_title: CHAT_SEL.item_title || null,
         order_id: CHAT_SEL.order_id || null, content: "", kind: "outgoing",
         created_at: new Date().toISOString(), unread: 0
       });
@@ -3002,15 +2786,27 @@ async function openOrderChat(o) {
 }
 
 /* ---------- 聊天媒体 / 内置图片 ---------- */
-async function mediaObjectUrl(url) {
+function safeMediaUrl(value) {
+  var url = String(value || "").trim();
   if (!url) return "";
-  if (url.indexOf("/api/") !== 0) return url;
-  if (MEDIA_BLOB_CACHE[url]) return MEDIA_BLOB_CACHE[url];
-  var res = await fetch(url, { headers: headers() });
+  if (url.indexOf("/api/") === 0 || url.indexOf("blob:") === 0) return url;
+  try {
+    var parsed = new URL(url, location.href);
+    // 只允许 http(s)：挡住 javascript:/file: 等协议被塞进 img.src 或 window.open
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.href;
+  } catch (e) { /* 非法 URL 一律丢弃 */ }
+  return "";
+}
+async function mediaObjectUrl(url) {
+  var safe = safeMediaUrl(url);
+  if (!safe) return "";
+  if (safe.indexOf("/api/") !== 0) return safe;
+  if (MEDIA_BLOB_CACHE[safe]) return MEDIA_BLOB_CACHE[safe];
+  var res = await fetch(safe, { headers: headers() });
   if (!res.ok) throw new Error(await explainError(res));
   var blob = await res.blob();
   var objectUrl = URL.createObjectURL(blob);
-  MEDIA_BLOB_CACHE[url] = objectUrl;
+  MEDIA_BLOB_CACHE[safe] = objectUrl;
   return objectUrl;
 }
 async function hydrateMediaElements(root) {
@@ -3022,7 +2818,9 @@ async function hydrateMediaElements(root) {
     var url = el.getAttribute("data-media-src");
     if (!url) continue;
     try {
-      el.src = await mediaObjectUrl(url);
+      var objectUrl = await mediaObjectUrl(url);
+      if (!objectUrl) throw new Error("不支持的媒体地址");
+      el.src = objectUrl;
       el.dataset.hydrated = "1";
     } catch (e) {
       el.dataset.hydrated = "1";
@@ -3035,7 +2833,9 @@ async function hydrateMediaElements(root) {
     var posterUrl = video.getAttribute("data-media-poster");
     if (!posterUrl) continue;
     try {
-      video.poster = await mediaObjectUrl(posterUrl);
+      var posterObjectUrl = await mediaObjectUrl(posterUrl);
+      if (!posterObjectUrl) throw new Error("不支持的封面地址");
+      video.poster = posterObjectUrl;
       video.dataset.posterHydrated = "1";
     } catch (e) { video.dataset.posterHydrated = "1"; }
   }
@@ -3054,6 +2854,7 @@ function appendSentChatMessage(msg) {
       account_id: msg.account_id, chat_id: msg.chat_id,
       sender_id: msg.sender_id, sender_name: msg.sender_name,
       buyer_id: msg.sender_id, item_id: msg.item_id || null,
+      item_title: msg.item_title || null,
       order_id: msg.order_id || null, unread: 0
     };
     S.chats.unshift(c);
@@ -3439,8 +3240,6 @@ function renderAll() {
   renderOverviewLists();
   renderAccounts();
   renderRules();
-  renderBuyerKeys();
-  renderBuyerAccounts();
   renderReplies();
   renderOrders();
   renderCards();
@@ -3872,13 +3671,11 @@ async function refresh(manual) {
       api("/api/accounts"), api("/api/status"), api("/api/rules"), api("/api/cards"),
       api("/api/cards/stock"), api("/api/orders?limit=200"), api("/api/messages?limit=100"),
       api("/api/config"), api("/api/reply-rules"), api("/api/item-models"),
-      api("/api/chats?limit=200"), api("/api/rate-records?limit=50"),
-      api("/api/buyer-keys?limit=200"), api("/api/buyer-accounts?limit=200")
+      api("/api/chats?limit=200"), api("/api/rate-records?limit=50")
     ]);
     S.accounts = r[0]; S.status = r[1]; S.rules = r[2]; S.cards = r[3];
     S.stock = r[4]; S.orders = r[5]; S.messages = r[6]; S.cfg = r[7];
     S.replyRules = r[8]; S.itemModels = r[9]; S.chats = r[10]; S.rateRecords = r[11];
-    S.buyerKeys = r[12]; S.buyerAccounts = r[13];
     notifyBaseline();
     renderAll();
     maybeAutoOpenChat();

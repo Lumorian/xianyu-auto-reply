@@ -83,6 +83,34 @@ def _path(name: str, default: Path) -> Path:
     return value if value.is_absolute() else BASE_DIR / value
 
 
+def _total_ram_mb() -> int:
+    """机器总内存（MB）；读不到返回 0。"""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _low_memory_default() -> bool:
+    """没有显式配置时，512 MB / 1 GB 的小机器自动进入低内存模式。
+
+    小于等于 768 MB 就按小内存处理：上传并发收紧、内存告警阈值生效。
+    开发机（几 GB 以上）完全不受影响，也不会因为「忘记设 XY_LOW_MEMORY」
+    把一台 512 MB 的机器跑到 OOM。
+    """
+    total = _total_ram_mb()
+    return 0 < total <= 768
+
+
+def _low_memory_env() -> bool:
+    """小内存开关：显式 XY_LOW_MEMORY 优先，否则按机器总内存自动判断。"""
+    return _bool("XY_LOW_MEMORY", _low_memory_default())
+
+
 def _int(name: str, default: int) -> int:
     """读一个整数配置；没配、填空或者填错都退回默认值。
 
@@ -113,8 +141,11 @@ class Settings:
     #: 内置图片 / 聊天视频存放目录。默认在 data/media 下，跟着 data/ 一起被忽略。
     media_dir: Path = field(default_factory=lambda: _path("XY_MEDIA_DIR", BASE_DIR / "data" / "media"))
     #: 单个上传文件的体积上限（MB）。视频走分片上传，太大会拖很久。
-    max_image_mb: int = field(default_factory=lambda: _int("XY_MAX_IMAGE_MB", 10))
-    max_video_mb: int = field(default_factory=lambda: _int("XY_MAX_VIDEO_MB", 20))
+    max_image_mb: int = field(default_factory=lambda: max(1, min(64, _int("XY_MAX_IMAGE_MB", 10))))
+    max_video_mb: int = field(default_factory=lambda: max(1, min(128, _int("XY_MAX_VIDEO_MB", 20))))
+    #: 整个 HTTP 请求体的上限（MB）。FastAPI 会在鉴权依赖之前读 body，
+    #: 没有这道闸，匿名请求用一个超大 JSON 就能把 512 MB 机器打满。
+    max_body_mb: int = field(default_factory=lambda: max(1, min(256, _int("XY_MAX_BODY_MB", 32))))
     host: str = field(default_factory=lambda: os.getenv("XY_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _int("XY_PORT", 8000))
     admin_token: str = field(default_factory=lambda: os.getenv("XY_ADMIN_TOKEN", ""))
@@ -132,6 +163,17 @@ class Settings:
     log_max_bytes: int = field(default_factory=lambda: _int("XY_LOG_MAX_BYTES", 10 * 1024 * 1024))
     #: 保留几份历史日志，默认 5
     log_backup_count: int = field(default_factory=lambda: _int("XY_LOG_BACKUP_COUNT", 5))
+
+    #: 小内存模式：上传并发、内存告警都会往省内存的方向收。
+    #: 默认按机器总内存自动判断（<= 768 MB 视为小机器），也可用 XY_LOW_MEMORY 强制。
+    low_memory: bool = field(default_factory=_low_memory_env)
+    #: 同时处理的图片 / 视频上传数。Pillow 解码一张大图可能吃掉几十 MB，
+    #: 512 MB 机器上必须把它压到个位数。
+    media_concurrency: int = field(
+        default_factory=lambda: max(1, min(8, _int("XY_MEDIA_CONCURRENCY", 1 if _low_memory_env() else 2)))
+    )
+    #: 进程 RSS 超过这个值就在日志里告警（MB）。0 = 不告警。
+    memory_warn_mb: int = field(default_factory=lambda: _int("XY_MEMORY_WARN_MB", 400))
 
     # 发货行为
     delivery_cooldown: int = field(default_factory=lambda: _int("XY_DELIVERY_COOLDOWN", 600))

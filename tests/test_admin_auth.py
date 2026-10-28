@@ -92,6 +92,79 @@ async def test_loopback_still_works_without_token(tmp_path, monkeypatch):
     assert res.status_code == 200
 
 
+async def test_forwarded_header_cannot_fake_loopback_without_token(tmp_path, monkeypatch):
+    """同机反代会把 peer 变成 127.0.0.1；带了代理头就不能再走本机兜底。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "GET", "/api/orders",
+        headers={"X-Forwarded-For": "203.0.113.9"},
+    )
+    assert res.status_code == 401
+    assert "XY_ADMIN_TOKEN" in res.json()["detail"]
+
+
+async def test_proxied_public_host_cannot_use_loopback_fallback(tmp_path, monkeypatch):
+    """反代保留公网域名 Host、又剥掉所有代理头时，peer 仍是 127.0.0.1。
+
+    这种请求不能让「本机无口令」兜底放行：Host 不是本机名字就按远程处理。
+    """
+    monkeypatch.setattr("app.config.settings.allowed_hosts", "panel.example.com", raising=False)
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "GET", "/api/orders",
+        headers={"Host": "panel.example.com"},
+    )
+    assert res.status_code == 401
+    assert "XY_ADMIN_TOKEN" in res.json()["detail"]
+
+
+async def test_lookalike_loopback_host_is_not_trusted(tmp_path, monkeypatch):
+    """127.evil.com 这种「以 127. 开头」的域名不能被当成回环地址。"""
+    monkeypatch.setattr("app.config.settings.allowed_hosts", "127.evil.com", raising=False)
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "GET", "/api/orders",
+        headers={"Host": "127.evil.com"},
+    )
+    assert res.status_code == 401
+    assert "XY_ADMIN_TOKEN" in res.json()["detail"]
+
+
+async def test_localhost_host_header_still_uses_loopback_fallback(tmp_path, monkeypatch):
+    """本机用 localhost / 127.0.0.1 访问仍免口令，不影响单机使用。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    for host in ("localhost", "127.0.0.1:8000"):
+        res = await call(app, "127.0.0.1", "GET", "/api/orders", headers={"Host": host})
+        assert res.status_code == 200
+
+
+async def test_oversized_content_length_is_rejected_before_auth(tmp_path, monkeypatch):
+    """鉴权依赖之前就会读 body；超大 Content-Length 必须直接 413。"""
+    monkeypatch.setattr("app.config.settings.max_body_mb", 1, raising=False)
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "203.0.113.9", "POST", "/api/accounts",
+        headers={"Content-Length": str(2 * 1024 * 1024)},
+        content=b"{}",
+    )
+    assert res.status_code == 413
+    assert "请求体太大" in res.json()["detail"]
+
+
+async def test_oversized_streamed_body_is_rejected(tmp_path, monkeypatch):
+    """chunked 请求没有 Content-Length，也要在流式读取时按累计字节拦住。"""
+    monkeypatch.setattr("app.config.settings.max_body_mb", 1, raising=False)
+    app, _ = make_app(tmp_path, monkeypatch)
+
+    async def body():
+        yield b"x" * (600 * 1024)
+        yield b"x" * (600 * 1024)
+
+    res = await call(app, "203.0.113.9", "POST", "/api/accounts", content=body())
+    assert res.status_code == 413
+    assert "请求体太大" in res.json()["detail"]
+
+
 async def test_allow_remote_without_token_is_refused(tmp_path, monkeypatch):
     """ALLOW_REMOTE 只放宽来源、不校验口令：没口令时它不能生效（否则等于全开）。"""
     app, _ = make_app(tmp_path, monkeypatch, allow_remote=True)
@@ -160,6 +233,66 @@ async def test_same_origin_write_is_allowed(tmp_path, monkeypatch):
         headers={"Origin": "http://127.0.0.1", "Sec-Fetch-Site": "same-origin"},
     )
     assert res.status_code == 404
+
+
+async def test_cross_site_get_with_side_effects_is_rejected(tmp_path, monkeypatch):
+    """GET 也可能建账号/同步聊天/打上游：跨站页面不能借浏览器触发。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    paths = (
+        "/api/config",              # 会按 TTL 请求 new-api /api/status
+        "/api/newapi/tokens",       # 会请求 new-api
+        "/api/accounts/1/items",    # 会请求闲鱼并写 item_titles
+        "/api/login/nope/poll",     # 确认后会建账号并启动监听
+    )
+    for path in paths:
+        res = await call(app, "127.0.0.1", "GET", path,
+                         headers={"Sec-Fetch-Site": "cross-site"})
+        assert res.status_code == 403, path
+        assert res.json()["detail"] == "跨站请求被拒绝"
+
+
+async def test_top_level_navigation_cannot_trigger_side_effect_get(tmp_path, monkeypatch):
+    """地址栏/书签打开是 Sec-Fetch-Site: none；攻击者也能用顶层导航触发副作用。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "GET", "/api/config",
+        headers={"Sec-Fetch-Site": "none"},
+    )
+    assert res.status_code == 403
+    assert res.json()["detail"] == "跨站请求被拒绝"
+
+
+async def test_cross_origin_get_with_side_effects_is_rejected(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "GET", "/api/config",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert res.status_code == 403
+
+
+async def test_referer_is_checked_when_origin_is_absent(tmp_path, monkeypatch):
+    """老浏览器不发 Origin 时，Referer 也要能挡住跨站 GET。"""
+    app, _ = make_app(tmp_path, monkeypatch)
+    bad = await call(
+        app, "127.0.0.1", "GET", "/api/accounts/1/items",
+        headers={"Referer": "https://evil.example/page"},
+    )
+    assert bad.status_code == 403
+    good = await call(
+        app, "127.0.0.1", "GET", "/api/accounts/1/items",
+        headers={"Referer": "http://127.0.0.1/some/page"},
+    )
+    assert good.status_code == 404  # 走到业务逻辑：账号不存在
+
+
+async def test_same_origin_get_with_side_effects_is_allowed(tmp_path, monkeypatch):
+    app, _ = make_app(tmp_path, monkeypatch)
+    res = await call(
+        app, "127.0.0.1", "GET", "/api/accounts/1/items",
+        headers={"Origin": "http://127.0.0.1", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert res.status_code == 404  # 过了同源检查，账号不存在
 
 
 async def test_security_headers_are_present(tmp_path, monkeypatch):

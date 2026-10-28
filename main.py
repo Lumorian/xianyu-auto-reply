@@ -146,6 +146,15 @@ def main() -> None:
             "XY_ADMIN_ALLOW_REMOTE=1 但没配 XY_ADMIN_TOKEN：该开关不会放宽无口令访问，"
             "远程请求仍会被 401。请设置 XY_ADMIN_TOKEN。"
         )
+    if not settings.admin_token:
+        # 监听回环地址时 validate_admin_binding() 会放行，但同机反向代理会把
+        # 远程请求的 peer 变成 127.0.0.1，_is_loopback() 就会误判成本机访问。
+        # 这里不能替用户判断有没有反代，只能把风险在启动时明确说出来。
+        logger.warning(
+            "未配置 XY_ADMIN_TOKEN：管理接口只接受本机访问。"
+            "如果通过 Nginx/Caddy 等反向代理对外提供后台，请务必设置 XY_ADMIN_TOKEN，"
+            "否则代理会把远程请求伪装成本机访问。"
+        )
 
     binding_error = validate_admin_binding(settings.host, settings.admin_token)
     if binding_error:

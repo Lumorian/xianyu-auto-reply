@@ -81,6 +81,29 @@ def test_flat_paid_card_is_parsed():
     assert is_paid_trigger(msg.content)
 
 
+def test_flat_message_carries_item_title():
+    """商品标题跟着消息一起带进来：聊天列表要显示商品名，不是一串商品 ID。"""
+    msg = parse_message(flat({"contentType": 1, "text": {"text": "在吗"}}), my_id=MY)
+    assert msg is not None
+    assert msg.item_id == ITEM_ID
+    assert msg.item_title == "dsv4.1f1017 0.0002/次"
+
+
+def test_flat_item_title_is_normalized_and_optional():
+    """标题里的换行 / 多空格要压成单空格；没有标题时是空串，不能是 None。"""
+    payload = flat({"contentType": 1, "text": {"text": "在吗"}})
+    payload["operation"]["sessionInfo"]["extensions"]["itemTitle"] = "  GPT  会员\n代充  "
+    msg = parse_message(payload, my_id=MY)
+    assert msg is not None
+    assert msg.item_title == "GPT 会员 代充"
+
+    payload["operation"]["sessionInfo"]["extensions"].pop("itemTitle")
+    msg = parse_message(payload, my_id=MY)
+    assert msg is not None
+    assert msg.item_title == ""
+    assert msg.item_id == ITEM_ID
+
+
 def test_flat_plain_text():
     payload = flat({"contentType": 1, "text": {"text": "在吗？这个能用多久"}})
     msg = parse_message(payload, my_id=MY)

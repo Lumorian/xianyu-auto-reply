@@ -20,6 +20,8 @@ from typing import Any
 
 import msgpack
 
+from .memory import cap_mapping
+
 logger = logging.getLogger(__name__)
 
 #: 卖家侧「买家已付款」类系统卡片文案，命中即视为待发货。
@@ -429,6 +431,9 @@ class IncomingMessage:
     sender_name: str
     content: str
     item_id: str | None = None
+    #: 商品标题（会话 extensions 里的 itemTitle）。只用于后台把「商品 1093…」
+    #: 显示成商品名；不参与任何发货判断 —— 它只是卖家给自己的商品起的名字。
+    item_title: str = ""
     order_id: str | None = None
     created_at: int = 0
     raw: dict[str, Any] = field(default_factory=dict)
@@ -664,6 +669,8 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
     content_text = "\n".join(texts).strip()
 
     item_id, order_id, order_trusted = _flat_ids(raw)
+    # sessionInfo.extensions 是服务端结构，itemTitle 就在这里，和 itemId 成对出现
+    item_title = " ".join(str(extensions.get("itemTitle") or "").split())
 
     try:
         created_at = int(session_info.get("createTime") or raw.get("createTime") or 0)
@@ -681,6 +688,7 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         sender_name=nickname,
         content=content_text,
         item_id=item_id,
+        item_title=item_title,
         order_id=order_id,
         created_at=created_at,
         raw=raw,
@@ -1241,6 +1249,9 @@ def note_unparsed(raw: dict[str, Any]) -> None:
         _UNKNOWN_SHAPES[shape] += 1
         return
     _UNKNOWN_SHAPES[shape] = 1
+    # 闲鱼改格式时可能出现成千上万种「键组合」；不设上限的话这张表
+    # 会跟着进程一起长，512 MB 的机器扛不住。超出就丢最早的计数。
+    cap_mapping(_UNKNOWN_SHAPES, 256)
 
     if shape == ("unread",):
         logger.warning(

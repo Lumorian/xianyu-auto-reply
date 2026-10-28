@@ -20,6 +20,7 @@ from typing import Any
 
 from .codec import IncomingMessage, is_ignored, is_paid_trigger
 from .db import Database
+from .memory import cap_mapping
 from .template import render_placeholders
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,8 @@ def compile_keyword_regex(pattern: str) -> re.Pattern[str] | None:
         except re.error as exc:
             logger.warning("关键词规则里的正则写错了，已跳过：%s（%s）", pattern, exc)
     _REGEX_CACHE[pattern] = compiled
+    # 后台规则可增可删；不让已删除规则的正则永久占着内存。
+    cap_mapping(_REGEX_CACHE, 256)
     return compiled
 
 

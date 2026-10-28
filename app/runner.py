@@ -61,6 +61,7 @@ from .engine import (
     quota_from_amount,
     render,
 )
+from .memory import cap_mapping, cap_set
 from .money import AmountError, amount_from_order_item, pick_amount
 from .rate import is_rate_request, rate_request_order, render_feedback
 from .upstream import (
@@ -836,6 +837,7 @@ class AccountWorker:
                 # 有它就说明推送通了、是我们的解析或注册位点有问题，而不是没人在说话。
                 if chat_id not in self._unread_notified:
                     self._unread_notified.add(chat_id)
+                    cap_set(self._unread_notified, 2000)
                     logger.warning(
                         "[%s] 会话 %s 有新消息，但这一帧只有未读标记、没有正文 —— "
                         "推送通得到，正文没拿到（注册位点或推送格式问题）",
@@ -925,6 +927,9 @@ class AccountWorker:
             sender_id=msg.sender_id,
             sender_name=msg.sender_name,
             item_id=msg.item_id,
+            # 标题不进 messages 表，db.log_message 会把它记到 item_titles 里，
+            # 会话列表就能显示商品名而不是一串数字
+            item_title=msg.item_title,
             order_id=msg.order_id,
             content=msg.content,
             kind="incoming",
@@ -1051,6 +1056,7 @@ class AccountWorker:
         if key in self._name_backfilled:
             return
         self._name_backfilled.add(key)
+        cap_set(self._name_backfilled, 2000)
         try:
             changed = await self.db.backfill_buyer_name(self.account_id, buyer_id, name)
         except Exception as exc:  # 回填失败不影响这次发货
@@ -1526,10 +1532,10 @@ class AccountWorker:
         assert client is not None
 
         safe_name = str(file_name or "video.mp4")
-        suffix = media_tools.extension_of(safe_name)
+        suffix = media_tools.video_extension(safe_name)
         try:
             info = await asyncio.to_thread(media_tools.probe_video, data)
-            poster = await asyncio.to_thread(media_tools.video_poster, data)
+            poster = await asyncio.to_thread(media_tools.video_poster, data, info)
             _, _, poster_w, poster_h = await asyncio.to_thread(media_tools.image_info, poster)
         except media_tools.MediaError as exc:
             raise XianyuError(str(exc)) from exc
@@ -1701,6 +1707,7 @@ class AccountWorker:
                 sender_id=buyer_id,
                 sender_name=buyer_name,
                 item_id=data.get("item_id") or None,
+                item_title=str(data.get("item_title") or ""),
                 order_id=data.get("order_id") or None,
                 content=content,
                 kind="incoming",
@@ -1938,6 +1945,7 @@ class AccountWorker:
             sender_name=pick_display_name(data.get("buyer_name")),
             content=str(data.get("content") or ""),
             item_id=data.get("item_id") or None,
+            item_title=str(data.get("item_title") or ""),
             order_id=data.get("order_id") or None,
             created_at=int(data.get("created_at") or 0),
             raw=data.get("raw") or {},
@@ -3015,6 +3023,7 @@ class AccountWorker:
         if not token_id:
             # 记一下，10 分钟内不再为这个买家（这个商品）扫令牌列表
             self._buyer_key_miss[miss_key] = time.monotonic()
+            cap_mapping(self._buyer_key_miss, 1000)
             return None
         self._buyer_key_miss.pop(miss_key, None)
         try:
@@ -4006,6 +4015,7 @@ class AccountWorker:
                 token_id = str((lookup.resolved or {}).get("token_id") or "")
                 if token_id:
                     self._key_hints[msg.sender_id] = (token_id, time.monotonic())
+                    cap_mapping(self._key_hints, 1000)
                     logger.info("[%s] 买家 %s 提前发了 Key（令牌 %s），先记下",
                                 self.name, msg.sender_id, token_id)
                     break
@@ -4085,6 +4095,7 @@ class AccountWorker:
                 lookup = await self._token_for_key_order(msg.sender_id, candidate)
                 if lookup.resolved is not None:
                     self._key_order_hints[msg.sender_id] = (candidate, time.monotonic())
+                    cap_mapping(self._key_order_hints, 1000)
                     logger.info("[%s] 买家 %s 提前提供了旧订单号 %s，先记下",
                                 self.name, msg.sender_id, candidate)
                     break
