@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from app.client import XianyuClient, XianyuError
+from app.client import RiskControl, XianyuClient, XianyuError, _pick_order
 
 
 class FakeWS:
@@ -116,3 +116,41 @@ async def test_send_text_carries_sid():
     client.sid = "sid-xyz"
     await client.send_text(client.websocket, "68100583197", "2000000000003", "hi")
     assert client.websocket.sent[0]["headers"]["sid"] == "sid-xyz"
+
+
+async def test_order_listing_propagates_risk_control():
+    """风控不能被当成「查不到订单」吞掉，否则 worker 不会退避。"""
+    client = make_client()
+
+    async def boom(api, data, version="1.0"):
+        raise RiskControl("RGV587")
+
+    client.mtop = boom  # type: ignore[method-assign]
+    with pytest.raises(RiskControl):
+        await client.find_order("2500000000000000001")
+    with pytest.raises(RiskControl):
+        await client.list_pending_orders()
+
+
+# ------------------------------------------- 订单精确匹配（鉴权前置条件）
+
+
+def test_pick_order_rejects_mismatched_single_item():
+    """回包只有一条、但订单号不是请求的那个：不能认成目标订单。
+
+    旧实现只要「只有一条 + 有 priceVO」就返回，买家编一个假单号就能拿
+    卖家唯一的那一单通过核实，进而在假单号下领走卡密。
+    """
+    response = {"data": {"module": {"items": [{
+        "commonData": {"orderId": "111", "orderStatus": "待发货"},
+        "priceVO": {"totalPrice": "10.00"},
+    }]}}}
+    assert _pick_order(response, "999") is None
+
+
+def test_pick_order_allows_legacy_single_item_without_order_id():
+    """旧接口回包不带 orderId 时，单条兜底仍然保留。"""
+    response = {"data": {"module": {"items": [{
+        "priceVO": {"totalPrice": "10.00"},
+    }]}}}
+    assert _pick_order(response, "999") is not None

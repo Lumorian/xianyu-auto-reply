@@ -149,6 +149,33 @@ async def test_create_token_restricts_models_by_default():
     assert captured["model_limits"] == "deepseek-v4.1-flash"
 
 
+async def test_create_token_accepts_per_item_model_limits():
+    """商品级配置可以覆盖客户端上的全局白名单。"""
+    captured = {}
+
+    def handler(request):
+        path = request.url.path
+        if path == "/api/status":
+            return httpx.Response(200, json={"data": {"quota_per_unit": 500000}})
+        if path.endswith("/key"):
+            return httpx.Response(200, json={"data": {"key": "sk-abcdefgh"}})
+        if path == "/api/token/" and request.method == "POST":
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"success": True})
+        return httpx.Response(200, json={"data": {"items": [{"id": 1, "name": "x"}]}})
+
+    client = make_newapi(
+        handler, access_token="jwt", user_id="3", model_limits="global-model"
+    )
+    try:
+        await client.create_token(10.0, "x", model_limits=" item-a ， item-b ")
+    finally:
+        await client.close()
+
+    assert captured["model_limits_enabled"] is True
+    assert captured["model_limits"] == "item-a,item-b"
+
+
 async def test_create_token_with_empty_model_limits_disables_restriction():
     """显式留空时才允许回到「不限制模型」的老行为。"""
     captured = {}
@@ -183,11 +210,14 @@ def test_normalize_model_limits_accepts_commas_and_spaces():
     assert normalize_model_limits("") == ""
 
 
-async def test_provisioner_wires_model_limits_from_settings(monkeypatch):
+async def test_provisioner_wires_model_limits_from_settings(monkeypatch, tmp_path):
     """Provisioner 必须把配置里的模型白名单传给 NewApiClient。"""
     from app.config import settings
     from app.upstream import Provisioner
 
+    # 指到一个不存在的库：不许读这台机器上真实的 app_config，
+    # 否则运营在后台改过「Key 模型限制」之后这个测试就会飘。
+    monkeypatch.setattr(settings, "db_path", tmp_path / "missing.db")
     monkeypatch.setattr(settings, "newapi_model_limits", "deepseek-v4.1-flash")
     provisioner = Provisioner()
     try:
@@ -255,8 +285,10 @@ async def test_cardshop_create_card_returns_code():
     assert code == "ABCD-EFGH"
     assert seen["path"] == "/api/admin/cards"
     assert seen["auth"] == "Bearer tok"
-    assert seen["body"]["quotaUsd"] == 10.0
-    assert seen["body"]["count"] == 1
+    # 卡密站改版后的契约：一卡一码，只收 code
+    assert seen["body"] == {
+        "code": "sk-abc", "label": "闲鱼 10 元", "quotaUsd": 10.0, "groups": 5,
+    }
 
 
 async def test_cardshop_error_surfaces():
@@ -307,8 +339,12 @@ async def test_provision_rolls_back_token_when_card_creation_fails():
     assert deleted == ["/api/token/9"]
 
 
-async def test_provision_happy_path_returns_card_code():
+async def test_provision_reports_cardshop_key_rejection():
+    """卡密站改版后拒收 API Key：这条规则必须失败并回滚令牌，不能留孤儿 Key。"""
     from app.upstream import Provisioner
+
+    posts: list[dict] = []
+    deleted: list[str] = []
 
     def newapi_handler(request):
         path = request.url.path
@@ -318,24 +354,33 @@ async def test_provision_happy_path_returns_card_code():
             return httpx.Response(200, json={"data": {"key": "sk-abcdefgh-0123"}})
         if path == "/api/token/" and request.method == "POST":
             return httpx.Response(200, json={"success": True})
+        if request.method == "DELETE":
+            deleted.append(path)
+            return httpx.Response(200, json={"success": True})
         return httpx.Response(200, json={"data": {"items": [{"id": 9, "name": "买家#1"}]}})
 
     def cardshop_handler(request):
-        return httpx.Response(200, json={"ok": True, "created": [{"code": "CODE-1234-5678"}]})
+        body = json.loads(request.content)
+        posts.append(body)
+        return httpx.Response(400, json={
+            "ok": False, "error": "额度兑换码不能是 API Key（旧版 Key 不再接受）",
+        })
 
     provisioner = Provisioner.__new__(Provisioner)
     provisioner.newapi = make_newapi(newapi_handler, access_token="jwt", user_id="3")
     provisioner.cardshop = make_cardshop(cardshop_handler, admin_token="tok")
 
     try:
-        result = await provisioner.provision(10.0, "10.00元 #1", "买家")
+        with pytest.raises(UpstreamError) as exc:
+            await provisioner.provision(10.0, "10.00元 #1", "买家")
     finally:
         await provisioner.close()
 
-    assert result.card_code == "CODE-1234-5678"
-    assert result.quota_usd == 10.0
-    assert result.token_id == "9"
-    assert result.key_mask.startswith("sk-abc")
+    assert "不再接受" in str(exc.value)
+    # 卡密站现在只认 code 字段
+    assert posts[0]["code"].startswith("sk-")
+    assert "key" not in posts[0] and "count" not in posts[0]
+    assert deleted == ["/api/token/9"]
 
 
 async def test_new_api_user_header_is_sent():
@@ -432,6 +477,75 @@ async def test_cardshop_login_with_password_when_no_token():
 
     assert code == "C-1"
     assert "admin_session=abc123" in (seen["cookie"] or "")
+
+
+async def test_cardshop_relogs_in_when_saved_session_expires():
+    """旧 Cookie 失效后自动重登并重试，不能把「未登录」留给每一单。"""
+    logins = 0
+    card_requests = 0
+
+    def handler(request):
+        nonlocal logins, card_requests
+        if request.url.path == "/api/admin/login":
+            logins += 1
+            return httpx.Response(
+                200, json={"ok": True},
+                headers={"set-cookie": "nac_admin=fresh; Path=/; HttpOnly"},
+            )
+        card_requests += 1
+        if request.headers.get("cookie") == "nac_admin=stale":
+            return httpx.Response(200, json={"ok": False, "error": "未登录，请先登录管理后台"})
+        assert request.headers.get("cookie") == "nac_admin=fresh"
+        return httpx.Response(200, json={"ok": True, "created": [{"code": "C-1"}]})
+
+    client = make_cardshop(handler, username="admin", password="pw")
+    client._http.cookies.set("nac_admin", "stale")
+    client._logged_in = True
+    try:
+        assert await client.create_card("reward-code", 1.0, "lbl") == "C-1"
+    finally:
+        await client.close()
+    assert logins == 1
+    assert card_requests == 2
+
+
+async def test_cardshop_reuses_card_when_server_says_reward_is_already_bound():
+    """建卡已落库但响应失败时，重试要取回原卡，不能困在唯一约束上。"""
+    paths = []
+
+    def handler(request):
+        paths.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(409, json={
+                "ok": False, "error": "第 1 个额度兑换码已经绑定到卡密 #66，不能重复使用",
+            })
+        return httpx.Response(200, json={
+            "ok": True, "list": {"items": [{"id": 66, "code": "EXISTING-CARD"}]},
+        })
+
+    client = make_cardshop(handler, admin_token="tok")
+    try:
+        assert await client.create_card("reward-code", 1.0, "lbl") == "EXISTING-CARD"
+    finally:
+        await client.close()
+    assert paths == [("POST", "/api/admin/cards"), ("GET", "/api/admin/cards")]
+
+
+async def test_cardshop_does_not_retry_non_authentication_errors():
+    requests = 0
+
+    def handler(request):
+        nonlocal requests
+        requests += 1
+        return httpx.Response(500, json={"ok": False, "error": "temporary failure"})
+
+    client = make_cardshop(handler, admin_token="tok")
+    try:
+        with pytest.raises(UpstreamError, match="temporary failure"):
+            await client.create_card("reward-code", 1.0, "lbl")
+    finally:
+        await client.close()
+    assert requests == 1
 
 
 async def test_user_id_bootstrap_impossible_with_only_token():
@@ -644,6 +758,32 @@ async def test_cny_site_does_not_overgrant_by_exchange_rate():
     assert captured["remain_quota"] == 68493
 
 
+async def test_status_failure_is_not_cached():
+    """一次 /api/status 抖动不能把错误汇率锁死整个进程。
+
+    旧实现失败时也会缓存「美元 1:1」；CNY 站点之后会一直按这个汇率超发。
+    """
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.url.path == "/api/status":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, text="temporarily down")
+            return httpx.Response(200, json={"data": CNY_STATUS})
+        return httpx.Response(200, json={"data": {}})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        first = await client.site_quota_model()
+        assert first.currency == "USD", "读失败时应临时按美元兜底"
+        second = await client.site_quota_model()
+        assert second.currency == "CNY", "第二次读取成功后必须用真实配置"
+        assert calls["n"] == 2, "失败结果不能被缓存"
+    finally:
+        await client.close()
+
+
 async def test_usd_site_keeps_legacy_math():
     """美元站点（exchangeRate=1）行为不变：1 元 = 500000 quota。"""
     captured = {}
@@ -707,3 +847,243 @@ async def test_custom_currency_uses_its_own_rate():
         await client.close()
 
     assert captured["remain_quota"] == 250000  # 1 / 2 * 500000
+
+
+# ------------------------------------------------------------------ 账号
+
+
+async def test_find_user_requires_exact_username():
+    """搜索是模糊的：搜 abc 会连 abc123 一起返回，绝不能拿第一条当真。"""
+    def handler(request):
+        assert request.url.path == "/api/user/search"
+        return httpx.Response(200, json={
+            "success": True,
+            "data": {"items": [
+                {"id": 1, "username": "abc123"},
+                {"id": 2, "username": "abc"},
+            ]},
+        })
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        user = await client.find_user("abc")
+        assert user["id"] == 2
+        # 只有 abc123 时，找 abc 必须返回 None，不能糊弄成「就是这个人」
+        assert await client.find_user("abcd") is None
+    finally:
+        await client.close()
+
+
+async def test_create_user_posts_role_and_resolves_id():
+    seen: dict = {}
+
+    def handler(request):
+        if request.url.path == "/api/user/" and request.method == "POST":
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"success": True, "message": ""})
+        if request.url.path == "/api/user/search":
+            return httpx.Response(200, json={
+                "success": True,
+                "data": {"items": [{"id": 11, "username": seen["body"]["username"]}]},
+            })
+        return httpx.Response(404, json={"success": False})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        user = await client.create_user("xinbuyer", "pw12345678")
+    finally:
+        await client.close()
+
+    assert seen["body"]["role"] == 1
+    assert seen["body"]["password"] == "pw12345678"
+    assert seen["body"]["display_name"] == "xinbuyer"
+    assert user["id"] == 11
+
+
+async def test_create_user_rejects_bad_name_without_network():
+    def handler(request):  # pragma: no cover - 不该被调用
+        raise AssertionError("不该发请求")
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        with pytest.raises(UpstreamError):
+            await client.create_user("x" * 21, "pw12345678")
+        with pytest.raises(UpstreamError):
+            await client.create_user("okname", "short")
+    finally:
+        await client.close()
+
+
+async def test_add_user_quota_posts_manage_with_converted_quota():
+    seen: dict = {}
+
+    def handler(request):
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={
+                "success": True, "data": {"quota_per_unit": 500000}})
+        if request.url.path == "/api/user/manage":
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"success": True})
+        if request.url.path == "/api/user/7":
+            return httpx.Response(200, json={
+                "success": True, "data": {"id": 7, "username": "abc", "quota": 5500000}})
+        return httpx.Response(404, json={"success": False})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        user = await client.add_user_quota("7", 10.0)
+        balance = await client.user_balance(user)
+    finally:
+        await client.close()
+
+    # 10 美元 × 500000 quota/美元
+    assert seen["body"] == {"id": 7, "action": "add_quota", "mode": "add", "value": 5000000}
+    assert user["quota"] == 5500000
+    assert balance == pytest.approx(11.0)
+
+
+async def test_add_user_quota_survives_balance_read_failure():
+    """额度加上了、随后读账号失败，绝不能抛异常——否则调用方会当成没充过再充一次。"""
+    def handler(request):
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={"success": True, "data": {"quota_per_unit": 500000}})
+        if request.url.path == "/api/user/manage":
+            return httpx.Response(200, json={"success": True})
+        return httpx.Response(500, json={"success": False})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        user = await client.add_user_quota("7", 10.0)
+        balance = await client.user_balance(user)
+    finally:
+        await client.close()
+
+    assert user == {"id": 7}
+    assert balance is None, "读不到余额要显示「—」，不能显示 0.00"
+
+
+# ------------------------------------------------------------------ 兑换码
+
+
+async def test_create_redemptions_posts_expected_payload():
+    seen: dict = {}
+
+    def handler(request):
+        if request.url.path == "/api/redemption/" and request.method == "POST":
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"success": True, "data": ["k" * 32]})
+        return httpx.Response(404, json={"success": False})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        codes = await client.create_redemptions(5_000_000, "买家#00000001")
+    finally:
+        await client.close()
+
+    assert codes == ["k" * 32]
+    assert seen["body"] == {
+        "name": "买家#00000001", "quota": 5_000_000, "count": 1, "expired_time": 0,
+    }
+
+
+async def test_create_redemptions_truncates_long_name():
+    """new-api 只收 1~20 个字的名称，超了会 400，必须自己先截。"""
+    seen: dict = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True, "data": ["k" * 32]})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        await client.create_redemptions(1, "很长的名字" * 10)
+    finally:
+        await client.close()
+
+    assert len(seen["body"]["name"]) == 20
+
+
+async def test_create_redemptions_partial_failure_raises():
+    """new-api 中途失败会回 200 + success=false + 已经生成的码：不能当成功。"""
+    def handler(request):
+        return httpx.Response(200, json={
+            "success": False, "message": "Failed to create redemption code",
+            "data": ["k" * 32],
+        })
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        with pytest.raises(UpstreamError):
+            await client.create_redemptions(1, "x")
+    finally:
+        await client.close()
+
+
+async def test_create_redemptions_explains_compliance_gate():
+    """new-api 的合规闸门报错是英文长句，要顺手翻成运营看得懂的提示。"""
+    def handler(request):
+        return httpx.Response(200, json={
+            "success": False,
+            "message": (
+                "Payment, redemption, subscription, and invitation reward features "
+                "are disabled. The administrator must confirm compliance terms before enabling them."
+            ),
+            "data": [],
+        })
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        with pytest.raises(UpstreamError) as exc:
+            await client.create_redemptions(1, "x")
+    finally:
+        await client.close()
+    assert "合规条款" in str(exc.value)
+
+
+async def test_create_redemptions_rejects_missing_codes():
+    def handler(request):
+        return httpx.Response(200, json={"success": True, "data": []})
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        with pytest.raises(UpstreamError):
+            await client.create_redemptions(1, "x")
+    finally:
+        await client.close()
+
+
+async def test_add_user_quota_denied_is_definite_error():
+    """权限不够（令牌没给「用户 编辑」）是确定的失败：可以安全重试 / 报警。"""
+    def handler(request):
+        return httpx.Response(403, json={
+            "success": False,
+            "code": "ACCESS_TOKEN_SCOPE_DENIED",
+            "message": "The access token lacks the required permission: user:write",
+        })
+
+    from app.upstream import TopupUncertainError
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        with pytest.raises(UpstreamError) as exc:
+            await client.add_user_quota("7", 10.0)
+    finally:
+        await client.close()
+    # 不能是「结果未知」：没加就是没加，重试是安全的
+    assert not isinstance(exc.value, TopupUncertainError)
+
+
+async def test_add_user_quota_connection_error_is_uncertain():
+    from app.upstream import TopupUncertainError
+
+    def handler(request):
+        if request.url.path == "/api/status":
+            return httpx.Response(200, json={"success": True, "data": {"quota_per_unit": 500000}})
+        raise httpx.ConnectError("boom", request=request)
+
+    client = make_newapi(handler, access_token="jwt", user_id="3")
+    try:
+        with pytest.raises(TopupUncertainError):
+            await client.add_user_quota("7", 10.0)
+    finally:
+        await client.close()

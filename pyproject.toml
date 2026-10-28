@@ -43,7 +43,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S108", "BLE001", "SIM117", "SLF001"]
+"tests/*" = ["S101", "S108", "S603", "S607", "BLE001", "SIM117", "SLF001"]
+# FastAPI 的 File/Form 默认值写法就是 B008 允许的例外
+"app/web.py" = ["B008"]
 # upstream 的预热与回滚就是要在模块内部操作两个 client 的私有连接
 "app/upstream.py" = ["SLF001"]
 

@@ -15,6 +15,7 @@ import base64
 import json
 
 import msgpack
+import pytest
 
 from app.db import Database
 from app.engine import DeliveryEngine
@@ -164,6 +165,32 @@ async def test_order_of_another_buyer_is_rejected(db):
     assert (await db.list_cards())[0]["status"] == "available"
 
 
+async def test_verify_order_rejects_mismatched_order_id(db):
+    """核实必须先确认返回的订单号就是请求的那个。"""
+    worker = await build(db)
+
+    async def find_other(order_id):
+        return order(order_id="2500000000000000999")
+
+    worker.client.find_order = find_other
+
+    assert await worker._verify_order_pending(ORDER, BUYER) is False
+
+
+async def test_verify_order_rejects_missing_buyer_id(db):
+    """拿不到买家 ID 就无法证明这单属于当前消息，不能放行。"""
+    worker = await build(db)
+    no_buyer = order()
+    no_buyer.pop("buyerInfoVO")
+
+    async def find_no_buyer(order_id):
+        return no_buyer
+
+    worker.client.find_order = find_no_buyer
+
+    assert await worker._verify_order_pending(ORDER, BUYER) is False
+
+
 async def test_system_card_is_trusted_without_lookup(db):
     """系统交易卡片来自交易链路，不需要再查一次订单。"""
     worker = await build(db, orders=[])  # 故意让 find_order 查不到
@@ -185,6 +212,30 @@ async def test_card_without_order_id_is_rejected(db):
 
 
 # ---------------------------------------------------------------- 卡密不丢
+
+
+async def test_unexpected_create_chat_error_releases_card(db):
+    """create_chat 抛非 XianyuError（如连接中断）也必须把卡还回库存。"""
+
+    class ExplodingChat(FakeClient):
+        async def create_chat(self, to_id, item_id):
+            raise RuntimeError("connection closed")
+
+    account_id = await db.upsert_account("主号3", "unb=" + MY + "; _m_h5_tk=t")
+    account = await db.get_account(account_id)
+    await db.save_rule(dict(CARD_RULE))
+    await db.add_cards(["CARD-0003"], "*")
+    worker = AccountWorker(db, account, DeliveryEngine(db))
+    worker.client = ExplodingChat()
+
+    with pytest.raises(RuntimeError):
+        await worker._fulfil_order({
+            "order_id": ORDER, "item_id": ITEM, "buyer_id": BUYER,
+            "buyer_name": "示例酸酸", "raw": {},
+        })
+
+    cards = {c["content"]: c for c in await db.list_cards()}
+    assert cards["CARD-0003"]["status"] == "available"
 
 
 async def test_dry_run_does_not_consume_card(db, monkeypatch):
@@ -298,6 +349,77 @@ async def test_card_shaped_message_with_untrusted_order_id_needs_verification(db
     assert not decision.should_deliver
     assert decision.reason == AUTH_BLOCKED_REASON
     assert (await db.list_cards())[0]["status"] == "available"
+
+
+async def test_delivery_persists_sending_before_success(db, monkeypatch):
+    """发货前必须先落 sending，成功后再变 delivered。"""
+    statuses: list[str] = []
+    original = db.record_order
+
+    async def spy(**fields):
+        statuses.append(str(fields.get("status")))
+        return await original(**fields)
+
+    monkeypatch.setattr(db, "record_order", spy)
+    worker = await build(db, orders=[order()])
+
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert statuses[:2] == ["sending", "delivered"]
+    assert (await db.list_orders())[0]["status"] == "delivered"
+
+
+async def test_acked_delivery_stores_message_id(db):
+    """走 ack 的发货路径要拿到 messageId 并写进流水，撤回功能才完整。"""
+    worker = await build(db, orders=[order()])
+
+    async def send_acked(chat_id, to_id, text):
+        worker.client.sent.append((chat_id, to_id, text))
+        return "m-delivered", "sent"
+
+    worker.client.send_delivery_text = send_acked
+    await worker._on_frame(frame_with(card_payload()))
+
+    messages = await db.list_messages()
+    outgoing = [m for m in messages if m["kind"] == "outgoing"]
+    assert outgoing and outgoing[-1]["external_id"] == "m-delivered"
+    assert (await db.list_orders())[0]["status"] == "delivered"
+
+
+async def test_unknown_send_keeps_card_sold_and_blocks_retry(db):
+    """ack 超时不等于没送达：卡不能退回，也不能自动重发。"""
+    worker = await build(db, orders=[order()])
+
+    async def send_unknown(chat_id, to_id, text):
+        return "", "unknown"
+
+    worker.client.send_delivery_text = send_unknown
+    await worker._on_frame(frame_with(card_payload()))
+
+    cards = await db.list_cards()
+    assert cards[0]["status"] == "sold", "结果未知时退卡会导致同一张卡卖两次"
+    orders = await db.list_orders()
+    assert orders[0]["status"] == "send_unknown"
+    assert await db.delivery_blocked(1, ORDER) is True
+
+    # 再来一条同单消息：不能再次发送/再次消耗卡密
+    await worker._on_frame(frame_with(card_payload()))
+    assert len(worker.client.sent) == 0
+    assert (await db.list_cards())[0]["status"] == "sold"
+
+
+async def test_rejected_send_releases_card(db):
+    """服务端明确拒收时，卡密必须回库存。"""
+    worker = await build(db, orders=[order()])
+
+    async def send_failed(chat_id, to_id, text):
+        return "", "failed"
+
+    worker.client.send_delivery_text = send_failed
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert (await db.list_cards())[0]["status"] == "available"
+    assert (await db.list_orders())[0]["status"] == "send_failed"
 
 
 async def test_confirm_shipping_failure_after_send_keeps_card_sold(db):

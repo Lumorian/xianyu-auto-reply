@@ -20,6 +20,7 @@ from typing import Any
 
 from .codec import IncomingMessage, is_ignored, is_paid_trigger
 from .db import Database
+from .template import render_placeholders
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,22 @@ def item_matches(rule: dict[str, Any], item_id: str | None) -> bool:
     if not item_id:
         return False
     return target == str(item_id).strip()
+
+
+def reply_entries(rule: dict[str, Any]) -> list[dict[str, Any]]:
+    """规则里的「关键词 -> 回复」条目。
+
+    新库每条规则至少有一条；这里仍兜底兼容「只有平铺 keywords/content」的
+    老对象（测试里手搓规则、或回填还没跑到的极老库）。
+    """
+    entries = rule.get("entries")
+    if entries:
+        return entries
+    return [{
+        "id": 0,
+        "keywords": rule.get("keywords") or "",
+        "content": rule.get("content") or "",
+    }]
 
 
 #: 关键词正则的长度上限。正常人写的关键词远短于这个数，
@@ -163,6 +180,9 @@ class ReplyDecision:
     action: str = "skip"  # "reply" | "skip"
     reason: str = ""
     rule: dict[str, Any] | None = None
+    #: 命中的具体回复条目（一条规则里可以配多条「关键词 -> 回复」）
+    entry: dict[str, Any] | None = None
+    entry_id: int = 0
     content: str = ""
     keyword: str = ""
     #: 会话标识：优先用 chat_id，没有就用「买家+商品」拼一个，保证去重粒度正确
@@ -184,10 +204,7 @@ def render_reply(template: str, *, buyer_name: str = "", item_id: str | None = N
         "keyword": keyword,
         "date": date or time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    out = template or ""
-    for key, value in values.items():
-        out = out.replace("{" + key + "}", str(value))
-    return out
+    return render_placeholders(template, values)
 
 
 def chat_key_of(msg: IncomingMessage) -> str:
@@ -211,8 +228,12 @@ class AutoReplyEngine:
         content = (msg.content or "").strip()
         if not content:
             return ReplyDecision(reason="空消息")
-        # 系统卡片（已付款待发货 / 交易关闭…）不自动回复：
-        # 付款那单该走发货，回一句「在的」只会干扰买家
+        # 系统卡片（已付款待发货 / 交易关闭 / 退款申请…）不自动回复：
+        # 付款那单该走发货，回一句「在的」只会干扰买家。
+        # 不要只靠文案列表判断：闲鱼会不断新增卡片类型，is_system_card
+        # 才是「这条不是买家真人打的字」的稳定信号。
+        if msg.is_system_card:
+            return ReplyDecision(reason="系统卡片")
         if is_ignored(content) or is_paid_trigger(content):
             return ReplyDecision(reason="系统提示消息")
 
@@ -225,71 +246,91 @@ class AutoReplyEngine:
         if not candidates:
             return ReplyDecision(reason="没有命中自动回复规则")
 
-        for rule, keyword in candidates:
-            reason = await self._blocked(account_id, msg, rule, chat_key)
+        empty_rules: list[str] = []
+        for rule, entry, keyword in candidates:
+            reason = await self._blocked(account_id, msg, rule, entry, chat_key)
             if reason:
                 logger.debug("自动回复规则 %s 跳过：%s", rule.get("name"), reason)
                 continue
             rendered = render_reply(
-                rule.get("content") or "",
+                entry.get("content") or "",
                 buyer_name=msg.sender_name,
                 item_id=msg.item_id,
                 order_id=msg.order_id,
                 keyword=keyword,
             )
             if not rendered.strip():
-                return ReplyDecision(reason=f"规则「{rule.get('name')}」文案为空", rule=rule)
+                # 这一条是空的就继续看后面的条目，别让一条写坏的回复挡住整条规则
+                empty_rules.append(str(rule.get("name")))
+                logger.warning("自动回复规则「%s」里有一条回复内容为空，已跳过", rule.get("name"))
+                continue
             return ReplyDecision(
                 action="reply",
-                reason=f"命中{('关键词' if rule.get('kind') == KIND_KEYWORD else '商品')}自动回复「{rule.get('name')}」",
+                reason=(
+                    f"命中{('关键词' if rule.get('kind') == KIND_KEYWORD else '商品')}"
+                    f"自动回复「{rule.get('name')}」"
+                ),
                 rule=rule,
+                entry=entry,
+                entry_id=int(entry.get("id") or 0),
                 content=rendered,
                 keyword=keyword,
                 chat_key=chat_key,
             )
+        if empty_rules:
+            return ReplyDecision(reason="命中的回复内容为空")
         return ReplyDecision(reason="命中的规则都在冷却或已回过")
 
     async def _rank(self, rules: list[dict[str, Any]], msg: IncomingMessage,
-                    content: str) -> list[tuple[dict[str, Any], str]]:
-        """按优先级排出候选规则。
+                    content: str) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+        """按优先级排出候选条目（规则里的每一条回复都是一个候选）。
 
         顺序：关键词规则 > 商品规则；同一类里按 rules 的
-        priority DESC, id 升序（数据库已经排好，这里保持相对顺序）。
+        priority DESC, id 升序（数据库已经排好，这里保持相对顺序）；
+        同一条规则内按 sort_order, id 升序。
         """
-        keyword_hits: list[tuple[dict[str, Any], str]] = []
-        item_hits: list[tuple[dict[str, Any], str]] = []
+        keyword_hits: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        item_hits: list[tuple[dict[str, Any], dict[str, Any], str]] = []
         for rule in rules:
             if not item_matches(rule, msg.item_id):
                 continue
             kind = str(rule.get("kind") or KIND_KEYWORD)
+            entries = reply_entries(rule)
             if kind == KIND_KEYWORD:
-                keyword = await match_keyword_async(
-                    content,
-                    split_keywords(rule.get("keywords")),
-                    str(rule.get("match_type") or MATCH_CONTAINS),
-                )
-                if keyword:
-                    keyword_hits.append((rule, keyword))
+                match_type = str(rule.get("match_type") or MATCH_CONTAINS)
+                for entry in entries:
+                    keyword = await match_keyword_async(
+                        content, split_keywords(entry.get("keywords")), match_type
+                    )
+                    if keyword:
+                        keyword_hits.append((rule, entry, keyword))
             else:
-                item_hits.append((rule, ""))
+                for entry in entries:
+                    item_hits.append((rule, entry, ""))
         # 商品专属规则优先于 * 通配，通配规则只在没有专属规则时兜底
         def spec(rule: dict[str, Any]) -> int:
             return 0 if str(rule.get("item_id") or "*") not in ("*", "", "all") else 1
 
-        keyword_hits.sort(key=lambda pair: spec(pair[0]))
-        item_hits.sort(key=lambda pair: spec(pair[0]))
+        keyword_hits.sort(key=lambda hit: spec(hit[0]))
+        item_hits.sort(key=lambda hit: spec(hit[0]))
         return keyword_hits + item_hits
 
     async def _blocked(self, account_id: int, msg: IncomingMessage, rule: dict[str, Any],
-                       chat_key: str) -> str:
-        """这个规则此刻不该回的原因；可以回则返回空串。"""
+                       entry: dict[str, Any], chat_key: str) -> str:
+        """这条回复此刻不该回的原因；可以回则返回空串。
+
+        去重 / 冷却按「规则里的条目」算：同一条规则里配了「发货」和「退款」，
+        在同一个会话里回完「发货」不影响「退款」该不该回。
+        """
+        rule_id = int(rule["id"])
+        entry_id = int(entry.get("id") or 0)
         if int(rule.get("once_per_chat") or 0) and await self.db.reply_hit_exists(
-            account_id, msg.sender_id, chat_key, int(rule["id"])
+            account_id, msg.sender_id, chat_key, rule_id, entry_id
         ):
             return "这个会话已经回过"
         cooldown = int(rule.get("cooldown") or 0)
         if cooldown > 0 and await self.db.reply_hit_recent(
-            account_id, msg.sender_id, int(rule["id"]), cooldown
+            account_id, msg.sender_id, rule_id, cooldown, entry_id=entry_id
         ):
             return f"冷却中（{cooldown} 秒）"
         return ""

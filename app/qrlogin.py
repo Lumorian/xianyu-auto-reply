@@ -24,6 +24,9 @@ from urllib.parse import quote
 
 import httpx
 
+from .config import DIRECT_HTTP
+from .sign import clean_cookie_pair, mask_keylike
+
 logger = logging.getLogger(__name__)
 
 UA = (
@@ -122,6 +125,7 @@ class QrLoginManager:
         if self._client_factory is not None:
             return self._client_factory()
         return httpx.AsyncClient(
+            **DIRECT_HTTP,
             timeout=httpx.Timeout(15.0),
             headers={"User-Agent": UA},
             follow_redirects=True,
@@ -360,16 +364,50 @@ class QrLoginManager:
         except httpx.HTTPError as exc:
             logger.debug("刷新 _m_h5_tk 失败：%s", exc)
 
+        # 域名白名单：只收闲鱼/淘宝/天猫/统计这几个域。
+        # 关键在 taobao.com —— 「保持登录」的长效票据 cookie17 是 passport
+        # 下发在 .taobao.com 上的，老实现只留 .goofish.com，等于把唯一能
+        # 让登录态活过 24 小时的那张票扔掉了。
+        #
+        # 匹配必须是「等于该域或它的子域」，不能用子串包含：
+        # 子串会把 evilgoofish.com / goofish.com.attacker.tld 一起放进来，
+        # 而我们这条串是要拼进发往 goofish 的 Cookie 头的。
         jar: dict[str, str] = {}
+        wanted_domains = ("goofish.com", "taobao.com", "tmall.com", "mmstat.com")
+
+        def _domain_ok(raw_domain: str) -> bool:
+            host = (raw_domain or "").strip().lstrip(".").lower()
+            if not host:
+                return False
+            return any(host == base or host.endswith("." + base) for base in wanted_domains)
+
         for cookie in session.client.cookies.jar:
-            domain = cookie.domain or ""
-            if ".goofish.com" in domain or ".mmstat.com" in domain:
-                jar[cookie.name] = cookie.value
+            if not _domain_ok(cookie.domain or ""):
+                continue
+            # 名字/值/长度同样要洗（详见 sign.clean_cookie_pair）：这串 Cookie
+            # 会被落库、并在之后每个请求里当请求头发出去。
+            cleaned = clean_cookie_pair(cookie.name, cookie.value)
+            if cleaned is None:
+                logger.warning("扫码登录拿到的 Cookie 里有一条不能安全使用，已丢弃")
+                continue
+            jar[cleaned[0]] = cleaned[1]
+
+        logger.info(
+            "扫码登录拿到的 Cookie：%s（%s cookie17 长效票据）",
+            ",".join(mask_keylike(name) for name in sorted(jar)),
+            "含" if jar.get("cookie17") else "不含",
+        )
 
         session.unb = jar.get("unb", "")
         session.nick = jar.get("tracknick", "") or jar.get("_nk_", "")
         session.cookie = "; ".join(f"{k}={v}" for k, v in jar.items())
 
+        if jar and not jar.get("cookie17"):
+            # 不是错误，但直接决定「明天这个点还得再扫一次」
+            logger.info(
+                "本次登录没有 cookie17（保持登录票据）：闲鱼网页登录态约 24 小时到期。"
+                "想少扫几次，就在浏览器里勾「保持登录」后复制整条 Cookie 粘贴进来"
+            )
         if not session.unb:
             session.status = "ERROR"
             session.error = "登录已确认但没拿到 unb，请重试或改用粘贴 Cookie"

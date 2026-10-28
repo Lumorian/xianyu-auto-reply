@@ -8,6 +8,10 @@ msgpack>=1.0
 # 扫码登录二维码
 qrcode>=7.4
 pillow>=10.0
+# FastAPI 接收 multipart（内置图片 / 聊天图片视频上传）
+python-multipart>=0.0.9
+# 账号 Cookie 落库加密（AES-256-GCM）
+cryptography>=42
 
 # 开发
 pytest>=8.0

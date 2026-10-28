@@ -48,7 +48,7 @@ class FakeProvisioner:
     def __init__(self):
         self.calls = []
 
-    async def provision(self, quota_usd, label, username=""):
+    async def provision(self, quota_usd, label, username="", model_limits=None):
         from app.upstream import Provisioned
 
         self.calls.append((quota_usd, label))

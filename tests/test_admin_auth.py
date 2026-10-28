@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import httpx
 
-from app.config import Settings
+from app.config import BASE_DIR, Settings
 
 
 def test_bad_int_env_falls_back_instead_of_crashing(monkeypatch):
@@ -29,6 +29,15 @@ def test_valid_int_env_is_honoured(monkeypatch):
     settings = Settings()
     assert settings.port == 9001
     assert settings.order_poll_interval == 7
+
+
+def test_db_path_empty_or_relative_is_resolved(monkeypatch):
+    """XY_DB_PATH= 不能变成 Path(".")；相对路径按项目根目录解释。"""
+    monkeypatch.setenv("XY_DB_PATH", "")
+    assert Settings().db_path == BASE_DIR / "data" / "app.db"
+
+    monkeypatch.setenv("XY_DB_PATH", "./data/x.db")
+    assert Settings().db_path == BASE_DIR / "data" / "x.db"
 
 
 # ------------------------------------------------------------ 管理接口鉴权
@@ -207,6 +216,19 @@ async def test_non_ascii_admin_token_still_answers_401(tmp_path, monkeypatch):
                      headers={"X-Admin-Token": "wrong"})
     assert res.status_code == 401
     assert res.json()["detail"] == "管理口令错误"
+
+
+def test_non_loopback_bind_without_token_is_rejected():
+    """监听 0.0.0.0 且没配口令时不能启动：反代会把远程请求变成本机。"""
+    from main import validate_admin_binding
+
+    assert validate_admin_binding("127.0.0.1", "") is None
+    assert validate_admin_binding("localhost", "") is None
+    assert validate_admin_binding("127.0.0.5", "") is None
+    bind_all = "0.0.0.0"  # noqa: S104 - 只是字符串，不涉及 bind
+    assert validate_admin_binding(bind_all, "") is not None
+    assert validate_admin_binding(bind_all, "s3cret") is None
+    assert validate_admin_binding("panel.example.com", "") is not None
 
 
 def test_uvicorn_does_not_trust_forwarded_headers():

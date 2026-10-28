@@ -453,6 +453,13 @@ class IncomingMessage:
     #: 「我已付款，等待你发货」也是合法的 content，光看正文根本分不出来。
     #: 真人文本必须额外核对订单状态才允许发货（见 runner._verify_order_pending）。
     is_system_card: bool = False
+    #: text / image / video。聊天界面按它决定渲染气泡还是媒体。
+    message_type: str = "text"
+    media_url: str = ""
+    media_thumb_url: str = ""
+    media_width: int | None = None
+    media_height: int | None = None
+    media_duration: int | None = None
 
 
 def _b64_json(value: Any) -> dict[str, Any]:
@@ -478,6 +485,54 @@ def decode_custom(content: dict[str, Any]) -> dict[str, Any]:
     """
     custom = _as_dict(content.get("custom"))
     return _b64_json(custom.get("data"))
+
+
+def extract_media_ref(payload: dict[str, Any] | None) -> tuple[str, str, str, int | None, int | None, int | None]:
+    """从消息体里提取图片/视频引用。
+
+    闲鱼图片：{"contentType":2, "image": {"pics":[{"url":..., "width":..}]}}
+    闲鱼视频：{"contentType":4, "video": {"url":..., "snapshot":..., "width":.., "duration":..}}
+    也兼容 photo / 顶层 pics 这些历史写法。
+    返回 (message_type, url, thumb_url, width, height, duration)。
+    """
+    if not isinstance(payload, dict):
+        return "text", "", "", None, None, None
+
+    video = payload.get("video")
+    if isinstance(video, dict):
+        url = str(video.get("url") or "").strip()
+        thumb = str(video.get("snapshot") or video.get("thumbUrl") or "").strip()
+        width = _positive_int(video.get("width"))
+        height = _positive_int(video.get("height"))
+        duration = _positive_int(video.get("duration"))
+        if url or thumb:
+            return "video", url, thumb, width, height, duration
+
+    image = payload.get("image") or payload.get("photo") or payload
+    if isinstance(image, dict):
+        url = str(image.get("url") or image.get("picUrl") or "").strip()
+        pics = image.get("pics")
+        if not url and isinstance(pics, list) and pics:
+            first = pics[0] if isinstance(pics[0], dict) else {}
+            url = str(first.get("url") or first.get("picUrl") or "").strip()
+            if isinstance(first, dict):
+                image = first
+        if url:
+            return (
+                "image", url, "",
+                _positive_int(image.get("width")),
+                _positive_int(image.get("height")),
+                None,
+            )
+    return "text", "", "", None, None, None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def collect_texts(*nodes: Any) -> list[str]:
@@ -618,6 +673,7 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
     nickname = pick_display_name(
         extensions.get("extUserName"), extensions.get("buyerNick"), fallback=""
     ) or ("买家" if (my_id and owner_id == my_id) else "对方")
+    msg_type, media_url, media_thumb, media_w, media_h, media_d = extract_media_ref(inner)
 
     return IncomingMessage(
         chat_id=chat_id,
@@ -631,6 +687,12 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         message_id=str(raw.get("messageId") or ""),
         is_system_card=_is_card_type(content_type, inner),
         order_id_trusted=order_trusted,
+        message_type=msg_type,
+        media_url=media_url,
+        media_thumb_url=media_thumb,
+        media_width=media_w,
+        media_height=media_h,
+        media_duration=media_d,
     )
 
 
@@ -932,6 +994,7 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
     if my_id and sender_id == my_id and not is_paid_trigger(content_text):
         return None
 
+    msg_type, media_url, media_thumb, media_w, media_h, media_d = extract_media_ref(inner)
     return IncomingMessage(
         chat_id=chat_id,
         sender_id=sender_id or "",
@@ -945,6 +1008,12 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
         raw=obj,
         message_id=str(obj.get("messageId") or ""),
         is_system_card=_is_card_type(content_type, inner),
+        message_type=msg_type,
+        media_url=media_url,
+        media_thumb_url=media_thumb,
+        media_width=media_w,
+        media_height=media_h,
+        media_duration=media_d,
         order_id_trusted=order_trusted,
     )
 
@@ -1036,6 +1105,7 @@ def _parse_numbered(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
     except (TypeError, ValueError):  # pragma: no cover - 脏数据防御
         created_at = 0
 
+    msg_type, media_url, media_thumb, media_w, media_h, media_d = extract_media_ref(block.payload)
     return IncomingMessage(
         chat_id=chat_id,
         sender_id=sender_id,
@@ -1048,6 +1118,12 @@ def _parse_numbered(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         message_id=str(msg_info.get("3") or ""),
         is_system_card=_is_card_type(block.content_type, block.payload),
         order_id_trusted=order_trusted,
+        message_type=msg_type,
+        media_url=media_url,
+        media_thumb_url=media_thumb,
+        media_width=media_w,
+        media_height=media_h,
+        media_duration=media_d,
     )
 
 

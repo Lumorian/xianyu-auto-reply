@@ -9,7 +9,7 @@ from pathlib import Path
 
 import uvicorn
 
-from app.config import BASE_DIR, settings
+from app.config import BASE_DIR, proxy_env_vars, settings
 from app.web import create_app
 
 
@@ -46,6 +46,12 @@ def setup_logging(*, console: bool = True) -> None:
         if not log_path.is_absolute():
             log_path = BASE_DIR / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # ctl.py/start.sh 可能在父进程里先创建了日志文件（umask 644）；
+            # 日志里有买家消息，收一下权限。轮转后的新文件会继承本进程 umask。
+            log_path.chmod(0o600)
+        except OSError:
+            pass
         file_handler = logging.handlers.RotatingFileHandler(
             log_path,
             maxBytes=settings.log_max_bytes,
@@ -58,6 +64,32 @@ def setup_logging(*, console: bool = True) -> None:
     # httpx 每个请求都打一行 INFO，太吵，只在排查时开 DEBUG
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # 后台页面每 5 秒轮询一次 /api/status 等接口，access log 能占满整个文件：
+    # 实测 10 MB 只够跑两小时，真正要看的「保活/过期」全被挤进轮转文件里。
+    # 只留 4xx/5xx（uvicorn 在 WARNING 级别记录异常请求）。
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+#: 只监听这些地址时，管理接口的「无口令本机兜底」才成立。
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def validate_admin_binding(host: str, token: str) -> str | None:
+    """监听非回环地址却没配管理口令时，返回拒绝启动的理由。
+
+    同机反向代理会让所有远程请求的 peer 都变成 127.0.0.1，从而被
+    _is_loopback() 当成「本机访问」。如果这里再没有口令，后台等于对公网敞开。
+    与其在日志里警告一句，不如直接不启动 —— 这类配置错误没人会主动去查日志。
+    """
+    if token:
+        return None
+    if host in LOOPBACK_HOSTS or host.startswith("127."):
+        return None
+    return (
+        f"XY_HOST={host} 监听非回环地址，但没有配置 XY_ADMIN_TOKEN。"
+        "同机反向代理会把远程请求变成「本机访问」，管理后台将没有口令保护。"
+        "请设置 XY_ADMIN_TOKEN，或把 XY_HOST 改回 127.0.0.1。"
+    )
 
 
 def uvicorn_run_kwargs() -> dict[str, object]:
@@ -79,6 +111,9 @@ def uvicorn_run_kwargs() -> dict[str, object]:
 
 
 def main() -> None:
+    # data/ 下有 Cookie、卡密、Key，logs/ 里有买家消息：新文件默认只给属主读。
+    # 已经在跑的旧文件仍建议手工 chmod 600（DB 的 init 会顺带修正自己）。
+    os.umask(0o077)
     # ./start.sh 会把这个置为 1：它的 stdout 已经指向日志文件了
     background = os.getenv("XY_BACKGROUND") == "1"
     setup_logging(console=not background)
@@ -92,12 +127,30 @@ def main() -> None:
             settings.log_max_bytes // 1024 // 1024,
             settings.log_backup_count,
         )
-    if settings.admin_allow_remote and not settings.admin_token:
-        # 这条组合等于「任何来源都不用口令就能管后台」：只放宽来源、不放宽口令才安全
+    # 闲鱼对登录 IP 很敏感：挂上代理后出口 IP 一变，服务端就会把长连接踢掉，
+    # 后台看起来就是「账号掉线」。所以所有出站请求都固定直连，不跟随代理环境变量；
+    # 操作者临时开代理上外网时，不该把正在接单的机器人一起带走。
+    logger.info("出站连接：一律直连（忽略 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / WS_PROXY）")
+    proxy_vars = proxy_env_vars()
+    if proxy_vars:
         logger.warning(
-            "XY_ADMIN_ALLOW_REMOTE=1 但没配 XY_ADMIN_TOKEN：管理接口对任何来源都不校验口令。"
-            "请设置 XY_ADMIN_TOKEN，或把 XY_ADMIN_ALLOW_REMOTE 改回 0。"
+            "检测到代理环境变量 %s：已忽略，全部直连。若账号仍然掉线，"
+            "多半是代理客户端的 TUN / 全局模式在接管流量，见 README「代理 / TUN」一节",
+            ", ".join(proxy_vars),
         )
+
+    if settings.admin_allow_remote and not settings.admin_token:
+        # 这个开关当前不会放宽「无口令访问」：没配 token 时远程请求仍会 401。
+        # 保留提示是怕有人以为自己已经放开了，实际远程根本进不来。
+        logger.warning(
+            "XY_ADMIN_ALLOW_REMOTE=1 但没配 XY_ADMIN_TOKEN：该开关不会放宽无口令访问，"
+            "远程请求仍会被 401。请设置 XY_ADMIN_TOKEN。"
+        )
+
+    binding_error = validate_admin_binding(settings.host, settings.admin_token)
+    if binding_error:
+        logger.error(binding_error)
+        raise SystemExit(1)
 
     uvicorn.run(create_app(), **uvicorn_run_kwargs())  # type: ignore[arg-type]
 

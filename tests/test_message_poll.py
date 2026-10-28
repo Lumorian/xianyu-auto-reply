@@ -16,7 +16,7 @@ from app.client import XianyuClient, _find_order_id, _url_param
 from app.config import settings
 from app.db import Database
 from app.engine import DeliveryEngine
-from app.runner import AccountWorker
+from app.runner import AccountWorker, iso_from_ms
 
 ME = "4100000003"
 BUYER = "2000000000004"
@@ -138,6 +138,25 @@ def test_parse_conversation_prefers_session_extension():
     assert parsed["order_id"] == "2500000000000000004"
     assert parsed["item_id"] == ITEM
     assert parsed["buyer_id"] == BUYER
+
+
+def test_parse_conversation_recovers_buyer_for_seller_sent_paid_card():
+    """卖家 sender 的付款卡片，买家 ID 要从会话 extension 取回，不能直接丢。"""
+    card = {"contentType": 26, "dxCard": {"item": {"main": {
+        "targetUrl": "fleamarket://order_detail?id=2500000000000000004&role=seller"
+    }}}}
+    conv = conversation(
+        sender=ME, text="[我已付款，等待你发货]", custom_type=26,
+        order_id="2500000000000000004",
+        content_payload=card,
+    )
+    parsed = client()._parse_conversation(conv)
+
+    assert parsed is not None
+    assert parsed["from_me"] is False
+    assert parsed["buyer_id"] == BUYER, "卖家 sender 也要能从 session extUserId 找回买家"
+    assert parsed["order_id"] == "2500000000000000004"
+    assert parsed["content_type"] == 26
 
 
 def test_parse_conversation_recovers_order_id_from_url():
@@ -266,6 +285,68 @@ async def test_new_message_after_baseline_triggers_reply(db, fast):
     assert len(worker.client.sent) == 1
     assert "在吗" not in worker.client.sent[0][2]
     assert "拍下自动发货" in worker.client.sent[0][2]
+
+
+async def test_old_history_is_not_replayed_after_baseline(db, fast):
+    """基线只把每个会话最后一条标 seen，之后的补拉不能把更早的旧消息当新消息。
+
+    旧实现 min_created_at 在基线后变成 0，同会话来新消息时会补拉 20 条历史，
+    其中启动前的 old-1 从未 seen，会被自动回复一遍。
+    """
+    worker = await build_worker(db, [
+        conversation(chat=CHAT, text="old-2", message_id="old-2", create_at=1792813000000)
+    ])
+    await save_item_reply(db)
+    set_connected_at(worker, 1792813119548)
+    await worker._poll_recent_messages()   # 基线：old-2 只记 seen，不回
+    await finish_replies(worker)
+    assert worker.client.sent == []
+
+    worker.client.history_from([
+        history_record(text="new message", message_id="new-1", create_at=1792815200000),
+        history_record(text="old-1", message_id="old-1", create_at=1792812000000),
+        history_record(text="old-2", message_id="old-2", create_at=1792813000000),
+    ])
+    worker.client.conversations = [
+        conversation(message_id="new-1", create_at=1792815200000, text="new message")
+    ]
+
+    handled = await worker._poll_recent_messages()
+    await finish_replies(worker)
+
+    assert handled == 1, "只有 new-1 是新消息"
+    assert len(worker.client.sent) == 1
+    incoming = [
+        m["content"] for m in await db.list_messages() if m["kind"] == "incoming"
+    ]
+    assert "old-1" not in incoming
+    logged = next(m for m in await db.list_messages() if m["content"] == "new message")
+    assert logged["created_at"] == iso_from_ms(1792815200000)
+
+
+async def test_seller_sent_paid_card_delivers_through_pull_path(db):
+    """会话列表里那条付款卡片即使 sender 是卖家，也要能正常发货。"""
+    card = {"contentType": 26, "dxCard": {"item": {"main": {
+        "targetUrl": "fleamarket://order_detail?id=2500000000000000004&role=seller"
+    }}}}
+    conv = conversation(
+        sender=ME, text="[我已付款，等待你发货]", custom_type=26,
+        order_id="2500000000000000004", content_payload=card,
+    )
+    worker = await build_worker(db, [conv])
+    await db.save_rule({
+        "name": "卡密池", "item_id": "*", "enabled": True, "mode": "card",
+        "content": "卡密：{card}", "auto_confirm": False, "priority": 0, "remark": "",
+    })
+    await db.add_cards(["CARD-SELLER-SENDER"], "*")
+
+    handled = await worker._poll_recent_messages()
+
+    assert handled == 1
+    assert len(worker.client.sent) == 1
+    assert "CARD-SELLER-SENDER" in worker.client.sent[0][2]
+    orders = await db.list_orders()
+    assert orders[0]["status"] == "delivered"
 
 
 async def test_same_message_is_not_handled_twice(db, fast):

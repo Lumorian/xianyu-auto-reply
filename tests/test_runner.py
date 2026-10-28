@@ -9,7 +9,7 @@ import json
 import msgpack
 import pytest
 
-from app.client import RiskControl
+from app.client import CookieExpired, RiskControl, XianyuClient
 from app.db import Database
 from app.engine import DeliveryEngine
 from app.runner import AccountWorker, WorkerManager
@@ -108,6 +108,54 @@ async def test_paid_message_triggers_delivery(db):
     assert orders[0]["card_id"] is not None
 
 
+async def test_ack_delivery_does_not_block_the_receive_loop(db):
+    """真实客户端等 ack 时，不能把收帧主循环自己卡死。
+
+    ack 回包只能由 _on_frame 的主循环 dispatch；如果在 _on_frame 里直接 await
+    send_delivery_text，回包永远没人处理，只能等 15 秒超时。
+    """
+    class SlowAckClient(XianyuClient):
+        def __init__(self) -> None:
+            super().__init__("unb=2000000000002; _m_h5_tk=tok_1")
+            self.websocket = self
+            self.started = asyncio.Event()
+            self.gate = asyncio.Event()
+            self.sent_text: list[str] = []
+
+        async def ack(self, ws, frame):
+            pass
+
+        async def send_delivery_text(self, chat_id, to_id, text):
+            self.started.set()
+            await self.gate.wait()
+            self.sent_text.append(text)
+            return "m-ack", "sent"
+
+        async def confirm_shipping(self, order_id):
+            return True, "SUCCESS"
+
+    await db.save_rule({
+        "name": "月卡", "item_id": "*", "enabled": True, "mode": "card",
+        "content": "卡密：{card}", "auto_confirm": False, "priority": 0, "remark": "",
+    })
+    await db.add_cards(["CARD-ACK"], "*")
+    account_id = await db.upsert_account("主号", "unb=2000000000002; _m_h5_tk=token_1")
+    account = await db.get_account(account_id)
+    worker = AccountWorker(db, account, DeliveryEngine(db))
+    worker.client = SlowAckClient()
+
+    await asyncio.wait_for(worker._on_frame(frame_with(card_payload())), timeout=1.0)
+    await asyncio.wait_for(worker.client.started.wait(), timeout=1.0)
+    assert worker.client.sent_text == []  # gate 还没开，说明它在等 ack 而不是主循环
+
+    worker.client.gate.set()
+    while worker._delivery_tasks:
+        await asyncio.gather(*list(worker._delivery_tasks))
+
+    assert len(worker.client.sent_text) == 1
+    assert (await db.list_orders())[0]["status"] == "delivered"
+
+
 async def test_same_order_not_delivered_twice(db):
     worker, _ = await build_worker(db)
     await db.save_rule({
@@ -138,6 +186,18 @@ async def test_self_message_is_ignored(db):
     payload["1"]["10"]["senderUserId"] = "2000000000002"
     await worker._on_frame(frame_with(payload))
     assert worker.client.sent == []
+
+
+async def test_invalid_cookie_is_cookie_expired_not_endless_retry(db):
+    """Cookie 缺 unb 时立刻归为需要重新扫码，而不是每 5 秒重连一次。"""
+    account_id = await db.upsert_account("坏 Cookie", "foo=bar")
+    account = await db.get_account(account_id)
+    worker = AccountWorker(db, account, DeliveryEngine(db))
+
+    with pytest.raises(CookieExpired):
+        await worker._once()
+    assert worker.status == "cookie_expired"
+    assert worker.client is None
 
 
 async def test_broken_frame_does_not_raise(db):

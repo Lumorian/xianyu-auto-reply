@@ -22,7 +22,8 @@ class FakeProvisioner:
         self.usernames: list[str] = []
         self.fail_with = fail_with
 
-    async def provision(self, quota_usd: float, label: str, username: str = "") -> Provisioned:
+    async def provision(self, quota_usd: float, label: str, username: str = "",
+                        model_limits: str | None = None) -> Provisioned:
         self.calls.append((quota_usd, label))
         self.usernames.append(username)
         if self.fail_with:
@@ -146,6 +147,54 @@ async def test_upstream_multiplier_and_fixed(db):
     assert provisioner.calls[0][0] == pytest.approx(20.0)
 
 
+async def test_cny_site_does_not_apply_cny_per_usd_twice(db, monkeypatch):
+    """CNY 展示站点的 quota 本身就是人民币，不能再按 XY_CNY_PER_USD 除一次。"""
+    from app.config import settings
+
+    class Site:
+        currency = "CNY"
+        quota_per_unit = 500000
+        exchange_rate = 7.3
+
+    class FakeNewApi:
+        async def site_quota_model(self):
+            return Site()
+
+    monkeypatch.setattr(settings, "cny_per_usd", 7.3)
+    await db.save_rule(dict(UPSTREAM_RULE))
+    provisioner = FakeProvisioner()
+    provisioner.newapi = FakeNewApi()  # type: ignore[attr-defined]
+    worker, _ = await build(db, provisioner)
+
+    await worker._on_frame(paid_frame())
+
+    assert provisioner.calls[0][0] == pytest.approx(10.0), "CNY 站点不应双重收窄"
+    assert (await db.list_orders())[0]["status"] == "delivered"
+
+
+async def test_usd_site_still_applies_cny_per_usd(db, monkeypatch):
+    from app.config import settings
+
+    class Site:
+        currency = "USD"
+        quota_per_unit = 500000
+        exchange_rate = 1.0
+
+    class FakeNewApi:
+        async def site_quota_model(self):
+            return Site()
+
+    monkeypatch.setattr(settings, "cny_per_usd", 7.3)
+    await db.save_rule(dict(UPSTREAM_RULE))
+    provisioner = FakeProvisioner()
+    provisioner.newapi = FakeNewApi()  # type: ignore[attr-defined]
+    worker, _ = await build(db, provisioner)
+
+    await worker._on_frame(paid_frame())
+
+    assert provisioner.calls[0][0] == pytest.approx(1.37)
+
+
 async def test_upstream_failure_sends_nothing(db):
     await db.save_rule(dict(UPSTREAM_RULE))
     provisioner = FakeProvisioner(fail_with="new-api 建令牌失败：额度超上限")
@@ -221,6 +270,45 @@ async def test_same_order_not_provisioned_twice(db):
     await worker._on_frame(frame)
     await worker._on_frame(frame)
     assert len(provisioner.calls) == 1
+
+
+async def test_send_failure_reuses_existing_card_instead_of_reprovisioning(db):
+    """发送失败重试时必须复用上一轮的卡密，不能重新开 Key。
+
+    旧实现每轮轮询都会重新 provision：一次网络抖动就留下一个孤儿令牌/卡密，
+    持续失败时会不断烧额度。
+    """
+    from app.client import XianyuError
+
+    await db.save_rule(dict(UPSTREAM_RULE))
+    provisioner = FakeProvisioner()
+    worker, _ = await build(db, provisioner)
+
+    original = worker.client.send_text_safe
+    state = {"fail": True}
+
+    async def flaky(chat_id, to_id, text):
+        if state["fail"]:
+            raise XianyuError("network down")
+        await original(chat_id, to_id, text)
+
+    worker.client.send_text_safe = flaky
+
+    await worker._on_frame(paid_frame())
+    assert len(provisioner.calls) == 1
+    assert (await db.list_orders())[0]["status"] == "send_failed"
+    first_code = (await db.list_orders())[0]["card_code"]
+    assert first_code
+
+    state["fail"] = False
+    await worker._on_frame(paid_frame())
+
+    assert len(provisioner.calls) == 1, "重试不能重新建 Key/卡密"
+    assert len(worker.client.sent) == 1
+    assert first_code in worker.client.sent[0][2]
+    orders = await db.list_orders()
+    assert orders[0]["status"] == "delivered"
+    assert orders[0]["card_code"] == first_code
 
 
 async def test_dry_run_never_calls_upstream(db, monkeypatch):

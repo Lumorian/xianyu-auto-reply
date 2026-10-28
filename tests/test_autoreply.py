@@ -51,6 +51,16 @@ async def save_reply_rule(db: Database, **fields) -> int:
     return await db.save_reply_rule(payload)
 
 
+async def test_system_card_is_never_auto_replied(db):
+    """新卡片类型不在忽略列表里时，也不能对它回「在的」。"""
+    await save_reply_rule(db)
+    decision = await AutoReplyEngine(db).decide(
+        1, make_message(content="我发起了退款申请", is_system_card=True)
+    )
+    assert not decision.should_reply
+    assert decision.reason == "系统卡片"
+
+
 # ---------------------------------------------------------------- 纯函数
 
 
@@ -103,6 +113,35 @@ async def test_keyword_reply_requires_keyword(db):
     assert not miss.should_reply
 
 
+async def test_one_rule_can_reply_with_different_entries_in_one_chat(db):
+    """一条规则配多条回复：同一会话里回完「发货」，不影响「退款」那条。"""
+    rule_id = await db.save_reply_rule({
+        "name": "商品 FAQ", "kind": "keyword", "item_id": "*",
+        "match_type": "contains",
+        "entries": [
+            {"keywords": "发货", "content": "24 小时内发"},
+            {"keywords": "退款", "content": "去订单里申请退款"},
+        ],
+        "enabled": True, "once_per_chat": True, "cooldown": 0, "priority": 0, "remark": "",
+    })
+    rule = await db.get_reply_rule(rule_id)
+    first_id, second_id = [entry["id"] for entry in rule["entries"]]
+    engine = AutoReplyEngine(db)
+
+    first = await engine.decide(1, make_message(content="什么时候发货"))
+    assert first.should_reply and first.content == "24 小时内发"
+    assert first.entry_id == first_id
+    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id, first.entry_id)
+
+    # 同一条回复再问会被「同一会话只回一次」挡住，但另一条关键词仍然能回
+    again = await engine.decide(1, make_message(content="什么时候发货"))
+    assert not again.should_reply
+
+    second = await engine.decide(1, make_message(content="怎么退款"))
+    assert second.should_reply and second.content == "去订单里申请退款"
+    assert second.entry_id == second_id
+
+
 async def test_keyword_rule_wins_over_item_rule(db):
     await save_reply_rule(db, name="商品默认", kind="item", content="默认回复")
     await save_reply_rule(db, name="关键词", kind="keyword", keywords="发货", content="关键词回复")
@@ -150,7 +189,7 @@ async def test_once_per_chat_blocks_second_hit(db):
     engine = AutoReplyEngine(db)
     first = await engine.decide(1, make_message())
     assert first.should_reply
-    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id)
+    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id, first.entry_id)
 
     again = await engine.decide(1, make_message())
     assert not again.should_reply
@@ -169,7 +208,7 @@ async def test_repeatable_rule_allows_multiple_replies(db):
     engine = AutoReplyEngine(db)
     first = await engine.decide(1, make_message())
     assert first.should_reply
-    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id)
+    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id, first.entry_id)
     assert (await engine.decide(1, make_message())).should_reply
 
 
@@ -178,7 +217,7 @@ async def test_cooldown_blocks_recent_hit(db):
     engine = AutoReplyEngine(db)
     first = await engine.decide(1, make_message())
     assert first.should_reply
-    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id)
+    await db.record_reply_hit(1, "4100000001", first.chat_key, rule_id, first.entry_id)
     assert not (await engine.decide(1, make_message())).should_reply
 
     # 冷却为 0 的规则可以立刻再回

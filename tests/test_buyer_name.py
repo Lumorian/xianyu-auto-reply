@@ -143,7 +143,7 @@ class FakeProvisioner:
     def __init__(self):
         self.usernames = []
 
-    async def provision(self, quota_usd, label, username=""):
+    async def provision(self, quota_usd, label, username="", model_limits=None):
         from app.upstream import Provisioned
 
         self.usernames.append(username)

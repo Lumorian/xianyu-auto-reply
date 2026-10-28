@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Final
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -24,8 +25,35 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(BASE_DIR / ".env")
 
 
+#: 所有出站 httpx 客户端都带这个：不读 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / WS_PROXY。
+#: 为什么：挂代理时闲鱼的出口 IP 会变，服务端直接把长连接踢掉（后台看着就是「账号掉线」），
+#: 而代理对 WebSocket 的支持也经常不稳。这个工具是常驻接单的，不该跟着操作者的代理跑。
+#: WebSocket 那边对应的是 websockets.connect(proxy=None)，见 app/client.py。
+DIRECT_HTTP: dict[str, bool] = {"trust_env": False}
+
+#: 代理环境变量（大小写都算）。这些变量对本工具无效，启动时只在日志里提一句。
+PROXY_ENV_KEYS: Final[frozenset[str]] = frozenset({
+    "http_proxy", "https_proxy", "all_proxy", "ws_proxy", "wss_proxy",
+})
+
+
+def proxy_env_vars() -> list[str]:
+    """环境里设了哪些代理变量（只用于启动日志提醒「会被忽略」）。"""
+    return sorted(
+        key for key in os.environ
+        if key.lower() in PROXY_ENV_KEYS and os.environ.get(key, "").strip()
+    )
+
+
 #: new-api 新建令牌默认只放行的模型。改这里等于改所有没显式配置的部署。
 DEFAULT_MODEL_LIMITS = "deepseek-v4.1-flash"
+
+#: 自动评价默认文案（只有买家确认收货并触发评价请求时才会用到）
+DEFAULT_AUTO_RATE_FEEDBACK = "不错的买家，交易愉快～"
+
+
+#: 默认的 SQLite 位置（相对路径最后落在这里）。密钥解析会拿它做「是不是默认库」的判断。
+DEFAULT_DB_PATH: Final[Path] = BASE_DIR / "data" / "app.db"
 
 
 def _float(name: str, default: float) -> float:
@@ -44,6 +72,15 @@ def _bool(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _path(name: str, default: Path) -> Path:
+    """读一个路径配置；相对路径按项目根目录解释（和 start.sh 的 cwd 无关）。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = Path(raw.strip()).expanduser()
+    return value if value.is_absolute() else BASE_DIR / value
 
 
 def _int(name: str, default: int) -> int:
@@ -69,7 +106,15 @@ class Settings:
     所有字段都可以通过 XY_ 前缀的环境变量覆盖，方便 Docker / systemd 部署。
     """
 
-    db_path: Path = field(default_factory=lambda: Path(os.getenv("XY_DB_PATH", str(BASE_DIR / "data" / "app.db"))))
+    #: SQLite 文件位置。和 media_dir 一样走 _path()：相对路径按项目根目录解释，
+    #: 空值回退默认值。以前直接 Path(os.getenv(...))，XY_DB_PATH= 会变成 Path(".")，
+    #: 启动时只报一句「unable to open database file」。
+    db_path: Path = field(default_factory=lambda: _path("XY_DB_PATH", DEFAULT_DB_PATH))
+    #: 内置图片 / 聊天视频存放目录。默认在 data/media 下，跟着 data/ 一起被忽略。
+    media_dir: Path = field(default_factory=lambda: _path("XY_MEDIA_DIR", BASE_DIR / "data" / "media"))
+    #: 单个上传文件的体积上限（MB）。视频走分片上传，太大会拖很久。
+    max_image_mb: int = field(default_factory=lambda: _int("XY_MAX_IMAGE_MB", 10))
+    max_video_mb: int = field(default_factory=lambda: _int("XY_MAX_VIDEO_MB", 20))
     host: str = field(default_factory=lambda: os.getenv("XY_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _int("XY_PORT", 8000))
     admin_token: str = field(default_factory=lambda: os.getenv("XY_ADMIN_TOKEN", ""))
@@ -152,6 +197,17 @@ class Settings:
     # 自动回复前先等几秒，避免「秒回」显得像机器人（也顺便错开连发）。0 = 立刻回。
     auto_reply_delay: float = field(default_factory=lambda: _float("XY_AUTO_REPLY_DELAY", 1.0))
 
+    # 自动评价：买家确认收货后，闲鱼会推一条「快给ta一个评价吧」的系统卡片。
+    # 默认关闭：评价是公开且不可撤销的，是否给每个买家好评应该由运营决定。
+    auto_rate_enabled: bool = field(default_factory=lambda: _bool("XY_AUTO_RATE", False))
+    auto_rate_feedback: str = field(
+        default_factory=lambda: os.getenv("XY_AUTO_RATE_FEEDBACK") or DEFAULT_AUTO_RATE_FEEDBACK
+    )
+    # 兜底轮询间隔（秒）：推送漏了时扫最近成交订单补评价。0 = 关闭轮询。
+    auto_rate_poll_interval: int = field(
+        default_factory=lambda: _int("XY_AUTO_RATE_POLL_INTERVAL", 600)
+    )
+
     # 订单轮询间隔（秒）。0 = 关闭。IM 推送丢了时靠它兜底发货。
     # 这是「一直没有推送」时的兜底节奏；有推送时下面那项会把轮询提前叫醒，
     # 所以实际发货延迟通常是几秒，而不是这个值。
@@ -179,9 +235,31 @@ class Settings:
     # 0 = 关闭主动刷新（仍然会在遇到「令牌过期」时被动刷新）。
     m_h5_tk_refresh_min: float = field(default_factory=lambda: _float("XY_MH5TK_REFRESH_MIN", 1.5 * 3600))
     m_h5_tk_refresh_max: float = field(default_factory=lambda: _float("XY_MH5TK_REFRESH_MAX", 2.5 * 3600))
-    # Cookie 保活间隔（秒），0 = 关闭。调用 passport hasLogin.do 让登录态续期。
+    # Cookie 保活间隔（秒），0 = 关闭。调 passport hasLogin.do 顺带合并 Cookie，
+    # 并触发一次业务接口的登录态自检（hasLogin 本身判断不了登录态，见 client.py）。
     session_keepalive_interval: float = field(
         default_factory=lambda: _float("XY_SESSION_KEEPALIVE_INTERVAL", 30 * 60)
+    )
+    # 登录态到期预警（小时）。闲鱼网页登录态实测是 24 小时整到期，
+    # 提前这么多小时在日志和后台标出来「该重新扫码了」。0 = 不预警。
+    relogin_warn_hours: float = field(
+        default_factory=lambda: _float("XY_RELOGIN_WARN_HOURS", 20.0)
+    )
+
+    # ---- 凭据落库加密 ----
+    # 账号 Cookie 用 AES-256-GCM 加密后再进 SQLite。关掉（0）等于把这层保护拆了，
+    # 只在你明确要「把库拷给别人排查」时临时用一下，且事后要改回来。
+    cookie_encryption: bool = field(default_factory=lambda: _bool("XY_COOKIE_ENCRYPTION", True))
+    # 密钥文件。丢了 = 库里所有 Cookie 都读不出来 = 重新扫码（这是加密的题中之义）。
+    # 备份数据库时**不要**把它一起带走，否则备份泄露 = 账号被接管。
+    cookie_key_path: Path = field(
+        default_factory=lambda: _path("XY_COOKIE_KEY_FILE", BASE_DIR / "data" / "cookie.key")
+    )
+    #: 密钥路径是不是用户显式配的。没配时密钥「跟着数据库走」（见 resolve_cookie_key_path）：
+    #: 用 XY_DB_PATH 指向临时库/备份库做实验时，不该拿生产密钥去加密它，
+    #: 也不该在仓库的 data/ 里凭空生出一把密钥。
+    cookie_key_explicit: bool = field(
+        default_factory=lambda: bool(os.getenv("XY_COOKIE_KEY_FILE", "").strip())
     )
 
     # 连接参数（一般不需要改）
@@ -195,6 +273,29 @@ class Settings:
 #: 后台「设置」页可覆盖的配置项 → app_config 表里的 key。
 #: 这些项在 .env 里仍然是默认值，但 web 后台保存过就以数据库为准。
 MODEL_LIMITS_KEY = "newapi_model_limits"
+AUTO_RATE_ENABLED_KEY = "auto_rate_enabled"
+AUTO_RATE_FEEDBACK_KEY = "auto_rate_feedback"
+
+
+def resolved_auto_rate(overrides: dict[str, str] | None = None) -> tuple[bool, str]:
+    """自动评价是否启用 + 评价文案。
+
+    优先级和模型白名单一致：后台「设置」页保存过 > .env > 默认值。
+    只支持好评（rate=1），文案留空时退回默认文案。
+    """
+    if overrides is None:
+        overrides = _config_overrides_from_db()
+    if AUTO_RATE_ENABLED_KEY in overrides:
+        enabled = str(overrides[AUTO_RATE_ENABLED_KEY]).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    else:
+        enabled = settings.auto_rate_enabled
+    if AUTO_RATE_FEEDBACK_KEY in overrides:
+        feedback = str(overrides[AUTO_RATE_FEEDBACK_KEY]).strip()
+    else:
+        feedback = str(settings.auto_rate_feedback or "").strip()
+    return enabled, feedback or DEFAULT_AUTO_RATE_FEEDBACK
 
 
 def resolved_model_limits(overrides: dict[str, str] | None = None) -> str:
@@ -211,6 +312,42 @@ def resolved_model_limits(overrides: dict[str, str] | None = None) -> str:
     if MODEL_LIMITS_KEY in overrides:
         return overrides[MODEL_LIMITS_KEY]
     return settings.newapi_model_limits
+
+
+def resolve_model_limits(
+    item_id: str | None,
+    item_models: dict[str, str],
+    overrides: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """这个商品新建 Key 实际使用的模型白名单，以及它从哪来。
+
+    优先级（高 → 低）：
+      1. 商品级配置（item_models[item_id]）；
+      2. 商品级通配（item_models["*"]）；
+      3. 后台「设置」页保存的全局值；
+      4. XY_NEWAPI_MODEL_LIMITS；
+      5. 内置默认值。
+
+    商品级配置写空串是**有意为之**的「这个商品不限制模型」，
+    所以不能用 or 兜底成全局值 —— 那会让运营以为放开了，实际没放开。
+
+    返回 (model_limits, source)，source ∈ item:<商品> / item:* / web / env / default。
+    """
+    key = str(item_id or "").strip()
+    if key and key in item_models:
+        return item_models[key], f"item:{key}"
+    if "*" in item_models:
+        return item_models["*"], "item:*"
+
+    if overrides is None:
+        overrides = _config_overrides_from_db()
+    if MODEL_LIMITS_KEY in overrides:
+        source = "web"
+    elif settings.newapi_model_limits:
+        source = "env"
+    else:
+        source = "default"
+    return resolved_model_limits(overrides), source
 
 
 def _config_overrides_from_db() -> dict[str, str]:
@@ -231,15 +368,40 @@ def _config_overrides_from_db() -> dict[str, str]:
         return {}
 
 
-def upstream_ready() -> bool:
-    """new-api 与卡密站是否都配置齐全（缺一个都不能走自动建 Key）。"""
-    newapi = bool(settings.newapi_base_url) and bool(
+def resolve_cookie_key_path(settings_obj: Settings) -> Path:
+    """Cookie 加密密钥该放哪。
+
+    规则：
+      * 显式配了 XY_COOKIE_KEY_FILE → 就用它；
+      * 没配、且用默认库（data/app.db）→ data/cookie.key
+        （和库分开，方便「备份库但不备份密钥」）；
+      * 没配、但用 XY_DB_PATH 指到别的库（测试 / 备份恢复演练）→ 放在那个库旁边
+        （<库文件>.key）。临时库不污染生产密钥，也不会把密钥生到仓库的 data/ 里。
+    """
+    if settings_obj.cookie_key_explicit:
+        return settings_obj.cookie_key_path
+    if Path(settings_obj.db_path) == DEFAULT_DB_PATH:
+        return settings_obj.cookie_key_path
+    return Path(str(settings_obj.db_path) + ".key")
+
+
+def newapi_ready() -> bool:
+    """new-api 是否配置齐全（建 Key 和「充值到已有 Key」都靠它）。"""
+    return bool(settings.newapi_base_url) and bool(
         settings.newapi_session or (settings.newapi_username and settings.newapi_password)
     )
-    cardshop = bool(settings.cardshop_base_url) and bool(
+
+
+def cardshop_ready() -> bool:
+    """卡密站是否配置齐全（只有「建 Key 出卡密」这条路需要它）。"""
+    return bool(settings.cardshop_base_url) and bool(
         settings.cardshop_admin_token or (settings.cardshop_username and settings.cardshop_password)
     )
-    return newapi and cardshop
+
+
+def upstream_ready() -> bool:
+    """new-api 与卡密站是否都配置齐全（缺一个都不能走「按订单金额建 Key 出卡密」）。"""
+    return newapi_ready() and cardshop_ready()
 
 
 settings = Settings()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import stat
 
 import pytest
 
@@ -24,6 +25,14 @@ def order_fields(**overrides):
     }
     data.update(overrides)
     return data
+
+
+async def test_database_file_is_private(tmp_path):
+    """DB 里有 Cookie/卡密/Key，不能是 644（同机其他用户可读）。"""
+    path = tmp_path / "private.db"
+    db = Database(path)
+    await db.init()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 async def test_concurrent_record_order_for_the_same_order_does_not_raise(tmp_path):
@@ -61,12 +70,92 @@ async def test_blocked_record_keeps_its_reason_after_delivery(db):
     assert "未经核实" in rows[0]["detail"]
 
 
+async def test_delivered_record_cannot_be_downgraded_to_blocked(db):
+    """已发货记录是终态：后续核实失败不能把它改成 blocked。
+
+    旧实现会直接覆盖 status，导致 delivered_order_exists() 变 False；
+    如果订单仍是待发货，轮询就会再发一次。
+    """
+    await db.record_order(**order_fields(
+        content="卡密：CARD-1", card_id=1, card_code="CARD-1", status="delivered",
+        detail="确认发货成功",
+    ))
+    await db.record_order(**order_fields(
+        rule_id=None, card_id=None, content="", status="blocked",
+        detail="真人文本消息，订单未经核实，不自动发货",
+    ))
+
+    rows = await db.list_orders()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "delivered"
+    assert rows[0]["content"] == "卡密：CARD-1"
+    assert rows[0]["card_id"] == 1
+    assert rows[0]["card_code"] == "CARD-1"
+    assert "已发货后收到 blocked" in rows[0]["detail"]
+    assert await db.delivered_order_exists(1, "2500000000000000001") is True
+
+
 async def test_record_order_without_order_id_always_inserts(db):
     """没有订单号（占位/调试）不参与唯一索引，写几条就是几条。"""
     a = await db.record_order(**order_fields(order_id=None))
     b = await db.record_order(**order_fields(order_id=None))
     assert a != b
     assert len(await db.list_orders()) == 2
+
+
+async def test_stale_sending_is_recovered_as_unknown(db):
+    """进程中断留下的 sending 不能当成未发货重发。"""
+    await db.record_order(**order_fields(status="sending", detail="正在发送", card_id=3))
+    assert await db.delivery_blocked(1, "2500000000000000001") is True
+
+    assert await db.recover_stale_sending() == 1
+    row = (await db.list_orders())[0]
+    assert row["status"] == "send_unknown"
+    assert "进程在发送过程中中断" in row["detail"]
+    assert row["card_id"] == 3
+
+    assert await db.recover_stale_sending() == 0
+
+
+async def test_add_cards_deduplicates_within_and_across_pools(db):
+    """同一张卡不能因为粘两次/换商品池就卖两次。"""
+    assert await db.add_cards(["CARD-1", "CARD-1", "  "], "*") == 1
+    assert await db.add_cards(["CARD-1"], "item-a") == 0, "跨池也不能重复"
+    assert await db.add_cards(["CARD-2"], "item-a") == 1
+
+    cards = await db.list_cards()
+    assert sorted(row["content"] for row in cards) == ["CARD-1", "CARD-2"]
+
+
+async def test_log_message_dedups_by_external_id(db):
+    """同一条服务端消息并发写入只能留一行；第二次返回同一 id。"""
+    fields = {
+        "account_id": 1, "chat_id": "c1", "sender_id": "b1", "sender_name": "买家",
+        "content": "hi", "kind": "incoming", "external_id": "m-1",
+    }
+    first = await db.log_message(**fields)
+    second = await db.log_message(**fields)
+    assert first == second
+    assert len(await db.list_messages()) == 1
+
+
+async def test_claim_message_seen_is_atomic(db):
+    """并发 claim 只能有一个成功，不能两边都拿到 False 后各处理一遍。"""
+    results = await asyncio.gather(
+        *(db.claim_message_seen(1, "c1:m-1") for _ in range(5))
+    )
+    assert sum(1 for ok in results if ok) == 1
+
+
+async def test_message_sender_indexes_exist(db):
+    """昵称回填/复用会话按 sender 查询，消息表需要对应索引。"""
+    rows = await db.fetch_all(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+        " AND name IN ('idx_messages_sender', 'idx_messages_sender_item')"
+    )
+    assert {row["name"] for row in rows} == {
+        "idx_messages_sender", "idx_messages_sender_item"
+    }
 
 
 async def test_unmark_messages_seen_allows_retry(db):

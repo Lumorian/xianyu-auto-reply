@@ -28,6 +28,9 @@ def ctl(tmp_path, monkeypatch):
     monkeypatch.setenv("XY_PORT", str(port))
     monkeypatch.setenv("XY_DB_PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("XY_LOG_FILE", str(tmp_path / "server.log"))
+    # 子进程会真的启动一次服务：密钥也必须落在 tmp 里，
+    # 不能在仓库 data/ 下凭空生出一把「生产密钥」
+    monkeypatch.setenv("XY_COOKIE_KEY_FILE", str(tmp_path / "cookie.key"))
 
     controller = ProcessController(
         tmp_path / "app.pid",
