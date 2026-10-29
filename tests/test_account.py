@@ -57,6 +57,7 @@ class FakeClient:
     async def find_order(self, order_id: str) -> dict | None:
         return {
             "commonData": {"orderId": order_id, "orderStatus": "待发货"},
+            "buyerInfoVO": {"buyerId": BUYER_ID},
             "priceVO": {"actualPayFee": "10.00"},
         }
 

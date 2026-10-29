@@ -76,3 +76,25 @@ def test_empty_log_file_means_console_only(monkeypatch):
     assert file_handlers == []
     for handler in list(root.handlers):
         root.removeHandler(handler)
+
+
+
+def test_debug_payload_redacts_buyer_pii():
+    """debug dump 只保留结构：昵称、头像、买家/订单 ID 都要打码。"""
+    from app.runner import redact_payload
+
+    redacted = redact_payload({
+        "senderUserId": "4100000001",
+        "buyerInfoVO": {
+            "userNick": "买家小王",
+            "avatar": "https://img.example/a.jpg",
+        },
+        "orderId": "2500000000000000001",
+        "content": "我的 Key 是 sk-abcdefghijklmnopqrstuvwxyz",
+    })
+
+    assert redacted["senderUserId"] == "***"
+    assert redacted["buyerInfoVO"]["userNick"] == "***"
+    assert redacted["buyerInfoVO"]["avatar"] == "***"
+    assert redacted["orderId"] == "***"
+    assert "abcdefghijklmnopqrstuvwxyz" not in redacted["content"]

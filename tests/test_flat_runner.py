@@ -26,7 +26,11 @@ class FakeClient:
         self.confirmed: list[str] = []
         self.acked: list[dict] = []
         self.websocket = self
-        self.order = {"priceVO": {"actualPayFee": "1.00"}}
+        self.order = {
+            "commonData": {"orderId": ORDER_ID, "itemId": ITEM_ID, "orderStatus": "待发货"},
+            "buyerInfoVO": {"buyerId": BUYER},
+            "priceVO": {"actualPayFee": "1.00"},
+        }
 
     async def ack(self, ws, frame):
         self.acked.append(frame)

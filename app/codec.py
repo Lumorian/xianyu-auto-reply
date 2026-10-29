@@ -392,9 +392,9 @@ def _is_card_type(content_type: Any, payload: dict[str, Any] | None = None) -> b
       1. 负载结构里带着 dxCard 这类只有交易链路才产出的**键**；
       2. contentType 不是 1/2（文本、图片），或压根认不出来。
 
-    注意：这里只是「消息形态」判断，**不是信任判断**。
-    真正决定要不要跳过订单核实的是 (is_system_card and order_id_trusted)，
-    见 engine.decide。
+    注意：这里只是「消息形态」判断，**不是信任判断**。自动发货不再依赖
+    order_id_trusted：runner 对所有付款触发都会核实订单归属。自动评价仍用
+    (is_system_card and order_id_trusted) 判断订单号是否来自结构化字段。
     """
     if _payload_is_card(payload):
         return True
@@ -404,7 +404,8 @@ def _is_card_type(content_type: Any, payload: dict[str, Any] | None = None) -> b
         return int(content_type) not in _HUMAN_CONTENT_TYPES
     except (TypeError, ValueError):
         # 认不出的类型（服务端给了非数字）：当卡片处理，避免把系统消息
-        # 当成买家真人文本去自动回复；是否可信仍由 order_id_trusted 决定。
+        # 当成买家真人文本去自动回复；自动评价是否可信仍看 order_id_trusted，
+        # 自动发货则一律以 runner 的订单核实结果为准。
         return True
 
 

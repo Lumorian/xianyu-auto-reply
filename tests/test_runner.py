@@ -37,6 +37,12 @@ class FakeClient:
         self.confirmed.append(order_id)
         return True, "SUCCESS"
 
+    async def find_order(self, order_id):
+        return {
+            "commonData": {"orderId": order_id, "orderStatus": "待发货"},
+            "buyerInfoVO": {"buyerId": "4100000001"},
+        }
+
     async def close(self):
         pass
 
@@ -133,6 +139,12 @@ async def test_ack_delivery_does_not_block_the_receive_loop(db):
 
         async def confirm_shipping(self, order_id):
             return True, "SUCCESS"
+
+        async def find_order(self, order_id):
+            return {
+                "commonData": {"orderId": order_id, "orderStatus": "待发货"},
+                "buyerInfoVO": {"buyerId": "4100000001"},
+            }
 
     await db.save_rule({
         "name": "月卡", "item_id": "*", "enabled": True, "mode": "card",

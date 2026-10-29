@@ -2174,6 +2174,85 @@ class Database:
         finally:
             await conn.close()
 
+    #: mark_sending 不允许覆盖的状态：已经发出、结果未知，或正由另一条路径发送。
+    _SENDING_CLAIM_BLOCKED = frozenset({
+        "delivered", "sending", "send_unknown", "topup_unknown",
+    })
+
+    async def mark_sending(self, **fields: Any) -> bool:
+        """原子认领发货：把订单从「可重试」推进到 sending。
+
+        为什么不复用 record_order：那个函数是记账入口，允许用 send_failed /
+        upstream_failed 覆盖上一次失败；它不判断「这单是不是已经发出去了」。
+        两条触发路径（IM 推送 + 订单轮询）各自决策、各自锁卡后，都调
+        record_order 写 sending，谁也拦不住谁，最后同一单会发两张卡。
+
+        这里用 BEGIN IMMEDIATE + 状态条件更新做认领：
+          * delivered / sending / send_unknown / topup_unknown 一律拒绝；
+          * send_failed / upstream_failed / provisioned / blocked 等可重试状态允许。
+        返回 True 表示本次抢到了发送权。
+        """
+        fields["status"] = "sending"
+        fields.setdefault("created_at", now_iso())
+        names = self._checked_columns(fields, self._ORDER_COLUMNS)
+        account_id = fields.get("account_id")
+        order_id = fields.get("order_id")
+
+        if not order_id:
+            columns = ", ".join(names)
+            placeholders = ", ".join("?" for _ in names)
+            await self.execute(
+                f"INSERT INTO orders ({columns}) VALUES ({placeholders})",  # noqa: S608 - 列名已过白名单
+                tuple(fields.values()),
+            )
+            return True
+
+        conn = await self.connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT id, status FROM orders WHERE account_id = ? AND order_id = ?",
+                (account_id, order_id),
+            )
+            existing = await cur.fetchone()
+            if existing is None:
+                columns = ", ".join(names)
+                placeholders = ", ".join("?" for _ in names)
+                await conn.execute(
+                    f"INSERT INTO orders ({columns}) VALUES ({placeholders})",  # noqa: S608 - 列名已过白名单
+                    tuple(fields.values()),
+                )
+                await conn.commit()
+                return True
+
+            previous_status = str(existing["status"] or "")
+            if previous_status in self._SENDING_CLAIM_BLOCKED:
+                await conn.rollback()
+                return False
+
+            update_fields = dict(fields)
+            update_fields.pop("created_at", None)
+            assignments = ", ".join(
+                f"{key} = ?" for key in update_fields if key != "account_id"
+            )
+            values = tuple(
+                value for key, value in update_fields.items() if key != "account_id"
+            )
+            cur = await conn.execute(
+                f"UPDATE orders SET {assignments} WHERE id = ? AND status = ?",  # noqa: S608 - 列名已过白名单
+                (*values, int(existing["id"]), previous_status),
+            )
+            if not (cur.rowcount or 0):
+                await conn.rollback()
+                return False
+            await conn.commit()
+            return True
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
     async def import_orders(self, rows: Iterable[dict[str, Any]]) -> tuple[int, int]:
         """批量导入外部（闲鱼）订单记录，只插入、绝不覆盖本机已有记录。
 

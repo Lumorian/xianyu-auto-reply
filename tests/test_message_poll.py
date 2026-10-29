@@ -233,6 +233,12 @@ class FakeClient:
     async def send_text_safe(self, chat_id, to_id, text):
         self.sent.append((chat_id, to_id, text))
 
+    async def find_order(self, order_id):
+        return {
+            "commonData": {"orderId": order_id, "orderStatus": "待发货"},
+            "buyerInfoVO": {"buyerId": BUYER},
+        }
+
     async def close(self):
         pass
 

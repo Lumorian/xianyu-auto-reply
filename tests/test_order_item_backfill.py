@@ -94,7 +94,8 @@ async def test_item_id_backfilled_from_order(db):
         "content": "卡密：{card}", "auto_confirm": True, "priority": 0, "remark": "",
         "usd_multiplier": 1.0, "fixed_usd": 0.0,
     })
-    order = {"commonData": {"orderId": ORDER_ID, "itemId": ITEM_ID},
+    order = {"commonData": {"orderId": ORDER_ID, "itemId": ITEM_ID, "orderStatus": "待发货"},
+             "buyerInfoVO": {"buyerId": BUYER},
              "priceVO": {"actualPayFee": "1.00"}}
     worker, provisioner = await build(db, order)
 
@@ -117,7 +118,8 @@ async def test_no_backfill_when_rule_is_wildcard(db):
         "content": "{card}", "auto_confirm": False, "priority": 0, "remark": "",
         "usd_multiplier": 1.0, "fixed_usd": 0.0,
     })
-    order = {"commonData": {"orderId": ORDER_ID, "itemId": ITEM_ID},
+    order = {"commonData": {"orderId": ORDER_ID, "itemId": ITEM_ID, "orderStatus": "待发货"},
+             "buyerInfoVO": {"buyerId": BUYER},
              "priceVO": {"actualPayFee": "1.00"}}
     worker, provisioner = await build(db, order)
 

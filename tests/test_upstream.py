@@ -96,7 +96,12 @@ UPSTREAM_RULE = {
 
 
 ORDER = {"commonData": {"orderId": "2500000000000000001", "orderStatus": "待发货"},
+         "buyerInfoVO": {"buyerId": "4100000001"},
          "priceVO": {"actualPayFee": "10.00"}}
+
+#: 订单能核实，但接口没给金额：用于测试固定额度 / 缺金额失败。
+NO_PRICE_ORDER = {"commonData": {"orderId": "2500000000000000001", "orderStatus": "待发货"},
+                  "buyerInfoVO": {"buyerId": "4100000001"}}
 
 
 async def build(db: Database, provisioner, order=ORDER):
@@ -253,7 +258,7 @@ async def test_upstream_rejects_amount_over_limit(db, monkeypatch):
 async def test_upstream_missing_order_data(db):
     await db.save_rule(dict(UPSTREAM_RULE))
     provisioner = FakeProvisioner()
-    worker, _ = await build(db, provisioner, order=None)
+    worker, _ = await build(db, provisioner, order=NO_PRICE_ORDER)
     await worker._on_frame(paid_frame())
 
     assert provisioner.calls == []
@@ -331,7 +336,7 @@ async def test_fixed_usd_works_without_order_amount(db):
     """规则里填了固定额度时，查不到订单金额也能发货。"""
     await db.save_rule({**UPSTREAM_RULE, "fixed_usd": 5.0})
     provisioner = FakeProvisioner()
-    worker, _ = await build(db, provisioner, order=None)
+    worker, _ = await build(db, provisioner, order=NO_PRICE_ORDER)
 
     await worker._on_frame(paid_frame())
 

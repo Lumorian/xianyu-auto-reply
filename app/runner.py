@@ -197,7 +197,9 @@ _ORDER_ID_RE = re.compile(r"(?<!\d)\d{15,20}(?!\d)")
 
 #: 完整 Key：sk- 开头 20+ 位，或 40~64 位纯字母数字（new-api 列表里是裸串）。
 #: 订单号是 15~20 位纯数字且长度不够，两边不会误判。
-_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])(?:sk-)?[A-Za-z0-9]{40,64}(?![A-Za-z0-9])")
+_API_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9]{20,64}|[A-Za-z0-9]{40,64})(?![A-Za-z0-9])"
+)
 #: 打码后的 Key（sk-ab12…wxyz / sk-***）：要能认出来，才能回一句准确的话。
 _MASKED_KEY_RE = re.compile(r"sk-[A-Za-z0-9]{0,20}(?:…|\.{3}|\*{2,})", re.IGNORECASE)
 
@@ -226,6 +228,30 @@ def _preview(text: str, limit: int = 120) -> str:
     if len(one_line) <= limit:
         return one_line
     return one_line[:limit] + f"…（共 {len(one_line)} 字）"
+
+
+#: debug dump 里需要打码的字段：买家昵称/头像/联系方式，以及各种可定位 ID。
+#: 日志经常被截图、贴群、进工单，完整负载等于把买家信息永久留档。
+_PII_FIELD_RE = re.compile(
+    r"(?:nick|name|avatar|phone|mobile|email|senderid|buyerid|userid|chatid|orderid|itemid|url)$",
+    re.IGNORECASE,
+)
+
+
+def redact_payload(value: Any, depth: int = 0) -> Any:
+    """递归给 debug 负载打码；保留结构用于排查，不保留买家 PII。"""
+    if depth > 6:
+        return "…"
+    if isinstance(value, dict):
+        return {
+            str(key): ("***" if _PII_FIELD_RE.search(str(key)) else redact_payload(item, depth + 1))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_payload(item, depth + 1) for item in value]
+    if isinstance(value, str):
+        return redact_keys(value[:300])
+    return value
 
 
 @dataclass(slots=True)
@@ -328,6 +354,8 @@ class AccountWorker:
         self._key_hints: dict[str, tuple[str, float]] = {}
         #: 买家 -> 试 Key 的次数 / 首次时间：防止有人刷屏（每次都可能有上游调用）
         self._key_attempts: dict[str, tuple[int, float]] = {}
+        #: 买家 -> 账号名查询次数 / 首次时间：防止拿机器人当用户名 oracle
+        self._account_lookups: dict[str, tuple[int, float]] = {}
         #: 令牌 id -> (明文 Key, 读取时间)：按 Key 认令牌时避免重复读
         self._token_key_cache: dict[str, tuple[str, float]] = {}
         #: (读取时间, 本站令牌列表)：按 Key 认令牌时先拿列表缩小范围
@@ -861,7 +889,7 @@ class AccountWorker:
                 if settings.debug_payload:
                     # 买家可能把 Key 贴在消息里：dump 也要打码，日志是会被转发的
                     logger.info("[%s][DUMP-未解析] %s", self.name,
-                                redact_keys(_json.dumps(payload, ensure_ascii=False)[:2000]))
+                                _json.dumps(redact_payload(payload), ensure_ascii=False)[:2000])
                 note_unparsed(payload)
             return
         if self.client and msg.sender_id == self.client.user_id:
@@ -872,7 +900,7 @@ class AccountWorker:
             logger.info("[%s][DUMP-已解析] content=%r item=%s order=%s 原文=%s",
                         self.name, redact_keys(msg.content[:60]), msg.item_id,
                         msg.order_id,
-                        redact_keys(_json.dumps(payload, ensure_ascii=False)[:1200]))
+                        _json.dumps(redact_payload(payload), ensure_ascii=False)[:1200])
 
         await self._process_incoming(msg)
 
@@ -959,12 +987,12 @@ class AccountWorker:
         # 所以必须在 return 之前处理；它只排后台任务，不阻塞收帧。
         await self._maybe_auto_rate(msg)
         if is_ignored(msg.content):
-            logger.debug("[%s] 忽略系统消息：%s", self.name, msg.content)
+            logger.debug("[%s] 忽略系统消息：%s", self.name, _preview(msg.content, 80))
             return None
 
         logger.info("[%s] 收到 %s(%s) 关于商品 %s 的消息：%s",
                     self.name, msg.sender_name, msg.sender_id, msg.item_id or "-",
-                    redact_keys(msg.content))
+                    _preview(msg.content))
 
         # 充值模式可能正在等买家发「旧订单号」。命中就先把充值做完，
         # 不要再让自动回复插一句「在的」。
@@ -980,11 +1008,11 @@ class AccountWorker:
         # 付款卡片），拉取路径可以等（保证同一会话的回复按顺序发出去）。
         reply_task = await self._maybe_auto_reply(msg) if allow_auto_reply else None
 
-        # 真人打的字要先去闲鱼核实订单。
-        # 只有「卡片形态 + 订单号来源可信」才免核实 —— 订单号如果是从正文里
-        # 捞出来的，那就跟买家自己打的一句话没有区别，必须核实。
-        trusted_card = msg.is_system_card and msg.order_id_trusted
-        if msg.order_id and not trusted_card and is_paid_trigger(msg.content):
+        # 所有付款触发都先去闲鱼核实订单，卡片也不例外。
+        # 卡片形态只能证明「这条消息像交易卡片」，不能证明订单属于当前买家：
+        # 转发别人的卡片、伪造 dxCard 负载都能过形态判断。只有订单接口返回的
+        # 状态和 buyerId 都匹配，才允许进入发货决策。
+        if msg.order_id and is_paid_trigger(msg.content):
             msg.order_verified = await self._verify_order_pending(msg.order_id, msg.sender_id)
 
         # 配置成固定文案 / 卡密池的规则在 decide 里就把文案渲染好了，
@@ -1979,7 +2007,8 @@ class AccountWorker:
             msg = self._to_incoming(msg_data)
             if msg is None:
                 continue
-            logger.debug("[%s] 拉取到 %s 的消息：%s", self.name, msg.sender_name, msg.content[:60])
+            logger.debug("[%s] 拉取到 %s 的消息：%s", self.name, msg.sender_name,
+                         _preview(msg.content, 60))
             # custom.type 不是 1 就是系统消息（14 提示 / 25 评价 / 26 卡片），别自动回复
             allow_reply = int(msg_data.get("custom_type") or 0) in (1, 0)
             reply_task = await self._process_incoming(msg, allow_auto_reply=allow_reply)
@@ -2302,6 +2331,10 @@ class AccountWorker:
         顺便挡住另一种误发：卡片自带的 buyer id 和订单真正的买家对不上
         （多端同步、转发、脏数据），那种单发出去就是发给错的人。
         """
+        if self.client is None or not hasattr(self.client, "find_order"):
+            logger.error("[%s] 客户端不支持查订单，无法核实订单 %s，拒绝发货",
+                         self.name, order_id)
+            return False
         order = await self._find_order_cached(order_id)
         if not order:
             logger.warning("[%s] 订单 %s 查不到，不能只凭聊天文本发货", self.name, order_id)
@@ -2489,10 +2522,11 @@ class AccountWorker:
 
         # 发送前先落一条 sending：如果进程在「消息已发、记录未写」之间死掉，
         # 启动时能把它识别为「结果未知」，而不是按未发货再发一次。
-        await self._record_sending(
+        if not await self._record_sending(
             msg, rule, decision, content, amount_cny, quota_usd, card_code, api_key_id,
             key_order_id,
-        )
+        ):
+            return False
 
         external_id = ""
         sender = getattr(self.client, "send_delivery_text", None)
@@ -2585,10 +2619,14 @@ class AccountWorker:
         card_code: str | None,
         api_key_id: str = "",
         key_order_id: str = "",
-    ) -> None:
-        """发送前落库，给「进程中断」留下可恢复的状态。"""
+    ) -> bool:
+        """发送前原子认领订单，给「进程中断」留下可恢复的状态。
+
+        返回 False 表示这一单已经发出、结果未知，或正被另一条路径发送：
+        本次必须中止，否则同一次付款会发两张卡 / 充两次值。
+        """
         try:
-            await self.db.record_order(
+            claimed = await self.db.mark_sending(
                 account_id=self.account_id, order_id=msg.order_id, item_id=msg.item_id,
                 buyer_id=msg.sender_id, buyer_name=msg.sender_name, rule_id=rule.get("id"),
                 card_id=decision.card_id, content=content, status="sending",
@@ -2601,6 +2639,11 @@ class AccountWorker:
             # 记账失败不能阻止发货；但这一单少了中断保护，日志里要留痕。
             logger.exception("[%s] 订单 %s 发货前写 sending 记录失败",
                              self.name, msg.order_id)
+            return True
+        if not claimed:
+            logger.warning("[%s] 订单 %s 已发出或正在由另一条路径发送，本次跳过",
+                           self.name, msg.order_id)
+        return claimed
 
     async def _record_send_unknown(
         self,
@@ -3613,24 +3656,36 @@ class AccountWorker:
         """消息里是不是发了打码后的 Key（长按复制复制到省略号的那种）。"""
         return bool(_MASKED_KEY_RE.search(str(content or "")))
 
+    @staticmethod
+    def _allow_bucket(store: dict[str, tuple[int, float]], key: str) -> bool:
+        """同一 key 10 分钟内最多 5 次；窗口外自动重置，顺手清理过期桶。"""
+        now = time.monotonic()
+        count, first = store.get(key, (0, now))
+        if now - first > 600:
+            count, first = 0, now
+        count += 1
+        store[key] = (count, first)
+        if len(store) > 500:
+            for old_key, value in list(store.items()):
+                if now - value[1] > 600:
+                    store.pop(old_key, None)
+        return count <= 5
+
     def _allow_key_attempt(self, buyer_id: str) -> bool:
         """同一买家 10 分钟内最多试 5 次 Key。
 
         每次试 Key 都可能要读令牌 / 翻列表，不设上限的话有人刷屏就能把
         上游打满；但也不能设太小，买家手抖多贴两遍是常事。
         """
-        now = time.monotonic()
-        count, first = self._key_attempts.get(buyer_id, (0, now))
-        if now - first > 600:
-            count, first = 0, now
-        count += 1
-        self._key_attempts[buyer_id] = (count, first)
-        if len(self._key_attempts) > 500:
-            self._key_attempts = {
-                key: value for key, value in self._key_attempts.items()
-                if now - value[1] <= 600
-            }
-        return count <= 5
+        return self._allow_bucket(self._key_attempts, buyer_id)
+
+    def _allow_account_lookup(self, buyer_id: str) -> bool:
+        """同一买家 10 分钟内最多查 5 次账号名。
+
+        账号模式允许买家发任意用户名并回显余额；不设限就等于把 new-api
+        的用户名/余额查询开放给所有人当枚举接口。5 次足够正常人试错。
+        """
+        return self._allow_bucket(self._account_lookups, buyer_id)
 
     async def _token_for_token_id(self, token_id: str, *,
                                   api_key: str = "") -> KeyOrderLookup:
@@ -4757,6 +4812,10 @@ class AccountWorker:
                     msg, DEFAULT_ACCOUNT_NAME_INVALID, order_id=order_id)
                 return True
             if self.provisioner is not None:
+                if not self._allow_account_lookup(msg.sender_id):
+                    await self._send_account_hint(
+                        msg, "账号查询太频繁，请 10 分钟后再试。", order_id=order_id)
+                    return True
                 try:
                     taken = await self.provisioner.find_account(name)
                 except UpstreamError as exc:
@@ -4795,6 +4854,10 @@ class AccountWorker:
             return False
         if self.provisioner is None:
             return False
+        if not self._allow_account_lookup(msg.sender_id):
+            await self._send_account_hint(
+                msg, "账号查询太频繁，请 10 分钟后再试。", order_id=order_id)
+            return True
         try:
             user = await self.provisioner.find_account(name)
         except UpstreamError as exc:

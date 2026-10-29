@@ -195,3 +195,46 @@ async def test_prune_history_is_off_when_disabled(db, days):
     await db.execute("UPDATE messages SET created_at = datetime('now', 'localtime', '-900 days')")
     assert await db.prune_history(days) == 0
     assert len(await db.list_messages()) == 1
+
+
+
+async def test_mark_sending_claims_a_fresh_order(db):
+    """新订单第一次发送：直接以 sending 落库，拿到发送权。"""
+    assert await db.mark_sending(**order_fields()) is True
+    rows = await db.list_orders()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "sending"
+    assert await db.delivery_blocked(1, "2500000000000000001") is True
+
+
+async def test_mark_sending_allows_retry_after_failure(db):
+    """上次发送失败可以重试；认领成功后状态必须变成 sending。"""
+    await db.record_order(**order_fields(status="send_failed", detail="网络错误"))
+    assert await db.mark_sending(**order_fields(status="sending")) is True
+    rows = await db.list_orders()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "sending"
+
+
+@pytest.mark.parametrize(
+    "blocked_status", ["delivered", "sending", "send_unknown", "topup_unknown"]
+)
+async def test_mark_sending_refuses_orders_that_already_left(db, blocked_status):
+    """已发出 / 结果未知 / 正在发送的单，不能被第二条路径再次认领。"""
+    await db.record_order(**order_fields(status=blocked_status, card_id=None))
+    assert await db.mark_sending(**order_fields()) is False
+    rows = await db.list_orders()
+    assert len(rows) == 1
+    assert rows[0]["status"] == blocked_status
+
+
+async def test_mark_sending_concurrent_claim_only_one_wins(db):
+    """两条触发路径同时认领同一单：只能有一个 True。"""
+    await db.record_order(**order_fields(status="send_failed", detail="上次失败"))
+
+    results = await asyncio.gather(*(db.mark_sending(**order_fields()) for _ in range(8)))
+
+    assert sum(1 for ok in results if ok) == 1
+    rows = await db.list_orders()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "sending"

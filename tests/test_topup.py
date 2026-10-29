@@ -58,7 +58,14 @@ class FakeClient:
 
     async def find_order(self, order_id: str) -> dict | None:
         self.order_lookups.append(order_id)
-        return self.order
+        if self.order is None:
+            return None
+        # 同一份替身可能服务多个订单：订单号以请求参数为准。
+        order = dict(self.order)
+        common = dict(order.get("commonData") or {})
+        common["orderId"] = order_id
+        order["commonData"] = common
+        return order
 
     async def close(self) -> None:
         pass
@@ -129,6 +136,7 @@ class FakeTopupProvisioner:
 
 ORDER = {"commonData": {"orderId": "2500000000000000001", "orderStatus": "待发货",
                         "itemTitle": "会员月卡 30 天"},
+         "buyerInfoVO": {"buyerId": "4100000001"},
          "priceVO": {"actualPayFee": "10.00"}}
 
 
@@ -711,6 +719,7 @@ def order_detail(item_id: str) -> dict:
     return {
         "commonData": {"orderId": "2500000000000000001", "orderStatus": "待发货",
                        "itemId": item_id, "itemTitle": "测试商品"},
+        "buyerInfoVO": {"buyerId": "4100000001"},
         "priceVO": {"actualPayFee": "10.00"},
     }
 
@@ -1892,6 +1901,7 @@ async def test_worker_prefetches_amount_for_price_rule(db):
     worker, _ = await build_worker(db, FakeTopupProvisioner(), order={
         "commonData": {"orderId": "2500000000000000001", "itemId": "900052644277",
                        "orderStatus": "待发货"},
+        "buyerInfoVO": {"buyerId": "4100000001"},
         "priceVO": {"actualPayFee": "5.00"},
     })
     await worker._on_frame(paid_frame())

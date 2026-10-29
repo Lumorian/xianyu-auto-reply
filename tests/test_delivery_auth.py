@@ -191,12 +191,22 @@ async def test_verify_order_rejects_missing_buyer_id(db):
     assert await worker._verify_order_pending(ORDER, BUYER) is False
 
 
-async def test_system_card_is_trusted_without_lookup(db):
-    """系统交易卡片来自交易链路，不需要再查一次订单。"""
+async def test_system_card_without_matching_order_is_rejected(db):
+    """卡片字段再像真的，查不到订单也不能发：卡片可以转发、可以伪造。"""
     worker = await build(db, orders=[])  # 故意让 find_order 查不到
     await worker._on_frame(frame_with(card_payload()))
 
-    assert len(worker.client.sent) == 1
+    assert worker.client.sent == []
+    assert (await db.list_cards())[0]["status"] == "available"
+
+
+async def test_system_card_of_another_buyer_is_rejected(db):
+    """卡片里的订单号属于别人：卡片形态再真也不能发。"""
+    worker = await build(db, orders=[order(buyer=OTHER_BUYER)])
+    await worker._on_frame(frame_with(card_payload()))
+
+    assert worker.client.sent == []
+    assert (await db.list_cards())[0]["status"] == "available"
 
 
 async def test_card_without_order_id_is_rejected(db):
@@ -354,13 +364,19 @@ async def test_card_shaped_message_with_untrusted_order_id_needs_verification(db
 async def test_delivery_persists_sending_before_success(db, monkeypatch):
     """发货前必须先落 sending，成功后再变 delivered。"""
     statuses: list[str] = []
-    original = db.record_order
+    original_claim = db.mark_sending
+    original_record = db.record_order
 
-    async def spy(**fields):
+    async def claim_spy(**fields):
+        statuses.append("sending")
+        return await original_claim(**fields)
+
+    async def record_spy(**fields):
         statuses.append(str(fields.get("status")))
-        return await original(**fields)
+        return await original_record(**fields)
 
-    monkeypatch.setattr(db, "record_order", spy)
+    monkeypatch.setattr(db, "mark_sending", claim_spy)
+    monkeypatch.setattr(db, "record_order", record_spy)
     worker = await build(db, orders=[order()])
 
     await worker._on_frame(frame_with(card_payload()))
@@ -432,8 +448,8 @@ async def test_confirm_shipping_failure_after_send_keeps_card_sold(db):
 
     rule = dict(CARD_RULE)
     rule["auto_confirm"] = True
-    worker = await build(db, rule=rule)
-    worker.client = TimeoutConfirm()
+    worker = await build(db, orders=[order()], rule=rule)
+    worker.client = TimeoutConfirm(orders=[order()])
 
     await worker._on_frame(frame_with(card_payload()))
 
@@ -447,7 +463,7 @@ async def test_confirm_shipping_failure_after_send_keeps_card_sold(db):
 async def test_db_failure_after_send_keeps_card_sold(db, monkeypatch):
     """发货记录写失败也不能退回卡密 —— 否则同一张卡会卖给下一个人。"""
     rule = dict(CARD_RULE)
-    worker = await build(db, rule=rule)
+    worker = await build(db, orders=[order()], rule=rule)
 
     async def boom(**fields):
         raise RuntimeError("disk I/O error")

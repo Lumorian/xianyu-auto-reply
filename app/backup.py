@@ -41,6 +41,11 @@ KEY_NAME = "cookie.key"
 MANIFEST_NAME = "manifest.json"
 MEDIA_DIR_NAME = "media"
 
+#: manifest.json 的读取上限。正常包只有几 KB；1 MB 已经非常宽裕。
+MAX_MANIFEST_BYTES = 1024 * 1024
+#: 单个迁移包解压后的总字节上限，防止 gzip 炸弹把磁盘打满。
+MAX_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
+
 #: 统计行数用；老库可能没有某张表，缺的就跳过。
 _COUNT_TABLES = (
     "accounts",
@@ -182,6 +187,32 @@ def _validate_member(member: tarfile.TarInfo) -> None:
     raise BackupError(f"归档里有不认识的文件：{member.name}")
 
 
+def _check_archive_size(members: list[tarfile.TarInfo], *, dest: Path | None = None) -> None:
+    """拒绝声明体积过大的归档；同时按目标磁盘余量再收紧一次。
+
+    tar 头里的 size 是权威值，解包只会写这么多字节；在解包前累加就能
+    挡住「几十 KB 的 gzip 解出几十 GB」的压缩炸弹。dest 给出时还要求
+    解压总量不超过可用空间的 90%，避免恢复过程把系统盘写满。
+    """
+    total = 0
+    for member in members:
+        if not member.isfile():
+            continue
+        if member.size < 0:
+            raise BackupError(f"归档成员大小非法：{member.name}")
+        total += member.size
+        if total > MAX_UNCOMPRESSED_BYTES:
+            raise BackupError(
+                f"迁移包解压后超过 {MAX_UNCOMPRESSED_BYTES // (1024 ** 3)} GB，拒绝解包"
+            )
+    if dest is not None:
+        free = shutil.disk_usage(dest).free
+        if total > int(free * 0.9):
+            raise BackupError(
+                f"迁移包解压需要 {total} 字节，目标磁盘只剩 {free} 字节，拒绝解包"
+            )
+
+
 def export_archive(
     db_path: str | Path,
     dest: str | Path,
@@ -284,10 +315,15 @@ def inspect_archive(archive_path: str | Path) -> dict[str, Any]:
             manifest_member = next((m for m in members if m.name == MANIFEST_NAME), None)
             if manifest_member is None:
                 raise BackupError("迁移包里没有 manifest.json")
+            if manifest_member.size > MAX_MANIFEST_BYTES:
+                raise BackupError(
+                    f"manifest.json 超过 {MAX_MANIFEST_BYTES} 字节，拒绝读取"
+                )
+            _check_archive_size(members)
             extracted = archive.extractfile(manifest_member)
             if extracted is None:
                 raise BackupError("读不到 manifest.json")
-            raw = extracted.read()
+            raw = extracted.read(MAX_MANIFEST_BYTES + 1)
     except BackupError:
         raise
     except (OSError, tarfile.TarError) as exc:
@@ -305,8 +341,11 @@ def inspect_archive(archive_path: str | Path) -> dict[str, Any]:
 def _extract_safe(archive_path: Path, dest: Path) -> None:
     """按白名单解包；拒绝绝对路径、..、链接和设备文件。"""
     with tarfile.open(archive_path, "r:gz") as archive:
-        for member in archive.getmembers():
+        members = archive.getmembers()
+        for member in members:
             _validate_member(member)
+        _check_archive_size(members, dest=dest)
+        for member in members:
             target = dest.joinpath(*_member_parts(member.name))
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)

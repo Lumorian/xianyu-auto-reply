@@ -10,8 +10,10 @@ def make_message(**overrides):
     """默认造一条「系统交易卡片」：真实链路上付款信息就是这么来的。
 
     要造「买家自己在聊天框打的字」，传 is_system_card=False。
-    要造「卡片形态但订单号是从正文里捞出来的」，传 order_id_trusted=False
-    —— 那种必须去核实订单，不能直接发。
+    默认 order_verified=True，代表 runner 已经向闲鱼核实过订单状态和买家；
+    要造未经核实的消息，显式传 order_verified=False。
+    要造「买家自己在聊天框打的字」，传 is_system_card=False。
+    卡片也可以被转发或伪造，所以 is_system_card 本身不再构成信任。
     """
     data = {
         "chat_id": "47983389096",
@@ -23,6 +25,8 @@ def make_message(**overrides):
         "is_system_card": True,
         # 真卡片的订单号来自 dxCard / reminderUrl 这类服务端字段
         "order_id_trusted": True,
+        # 默认视为 runner 已核实；安全用例里显式置 False
+        "order_verified": True,
     }
     data.update(overrides)
     return IncomingMessage(**data)
@@ -122,7 +126,12 @@ async def test_typed_paid_text_from_buyer_does_not_deliver(db):
 
     engine = DeliveryEngine(db)
     # 带订单号但没核实过：被鉴权条文拦下
-    typed = await engine.decide(1, make_message(is_system_card=False, order_id="2500000000000000001"))
+    typed = await engine.decide(
+        1,
+        make_message(
+            is_system_card=False, order_id="2500000000000000001", order_verified=False
+        ),
+    )
     assert not typed.should_deliver
     assert "核实" in typed.reason
     # 连订单号都没有：更早一步就被拦
@@ -168,3 +177,20 @@ async def test_ignored_system_message(db):
     engine = DeliveryEngine(db)
     decision = await engine.decide(1, make_message(content="[我已拍下，待付款]"))
     assert not decision.should_deliver
+
+
+async def test_trusted_card_still_needs_order_verification(db):
+    """卡片字段可信不等于订单归属可信：未核实就必须拒绝。"""
+    await db.save_rule({
+        "name": "月卡", "item_id": "*", "enabled": True, "mode": "card",
+        "content": "卡密：{card}", "auto_confirm": False, "priority": 0, "remark": "",
+    })
+    await db.add_cards(["CARD-0001"], "*")
+
+    engine = DeliveryEngine(db)
+    decision = await engine.decide(
+        1, make_message(is_system_card=True, order_id_trusted=True, order_verified=False)
+    )
+    assert not decision.should_deliver
+    assert "核实" in decision.reason
+    assert (await db.list_cards())[0]["status"] == "available"

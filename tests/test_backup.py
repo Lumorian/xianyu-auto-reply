@@ -179,3 +179,34 @@ async def test_key_can_travel_with_archive(tmp_path):
     account = await restored.get_account(1)
     assert account is not None
     assert account["cookie"] == "session=abc"
+
+
+
+def test_rejects_oversized_manifest(tmp_path, monkeypatch):
+    """manifest 再小也要有硬上限，不能先整份读进内存再判断。"""
+    import app.backup as backup
+
+    archive = tmp_path / "big-manifest.tar.gz"
+    _make_tar(
+        archive,
+        {"format": "xianyu-auto-reply-backup", "version": 1, "padding": "x" * 64},
+        {"app.db": b"sqlite"},
+    )
+    monkeypatch.setattr(backup, "MAX_MANIFEST_BYTES", 16)
+    with pytest.raises(BackupError, match="manifest"):
+        inspect_archive(archive)
+
+
+def test_rejects_oversized_uncompressed_archive(tmp_path, monkeypatch):
+    """几十 KB 的包解出几十 GB 的压缩炸弹，必须在解包前按声明体积拒绝。"""
+    import app.backup as backup
+
+    archive = tmp_path / "bomb.tar.gz"
+    _make_tar(
+        archive,
+        {"format": "xianyu-auto-reply-backup", "version": 1},
+        {"app.db": b"x" * 4096},
+    )
+    monkeypatch.setattr(backup, "MAX_UNCOMPRESSED_BYTES", 1024)
+    with pytest.raises(BackupError, match="解压后超过"):
+        inspect_archive(archive)

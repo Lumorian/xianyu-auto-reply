@@ -132,8 +132,12 @@ class FakeClient:
         return True, "SUCCESS"
 
     async def find_order(self, order_id):
-        # 规则用固定额度，不需要真去查金额；返回 None 走 fixed_usd 分支
-        return None
+        # 规则用固定额度：返回订单但故意不带金额字段，走 fixed_usd 分支。
+        # 必须带上订单号、状态和买家，发货前核实才能通过。
+        return {
+            "commonData": {"orderId": order_id, "orderStatus": "待发货"},
+            "buyerInfoVO": {"buyerId": BUYER},
+        }
 
     async def close(self):
         pass
