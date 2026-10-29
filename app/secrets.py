@@ -99,7 +99,7 @@ class CookieVault:
         if not CRYPTO_OK:
             raise SecretError(
                 "缺少 cryptography，账号 Cookie 无法加密/解密。"
-                "请重跑 ./start.sh 安装依赖（requirements.txt 里已声明），"
+                "请重跑 ./start.sh 安装依赖（requirements.lock 里已锁定），"
                 "或显式设置 XY_COOKIE_ENCRYPTION=0 关闭加密（不建议）"
             )
 

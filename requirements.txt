@@ -1,3 +1,5 @@
+# 依赖输入清单。安装请用 requirements.lock（含传递依赖与 sha256）。
+# 修改本文件后重新生成锁文件，命令见 README 的「依赖锁定」。
 fastapi>=0.110
 uvicorn>=0.29
 aiosqlite>=0.20

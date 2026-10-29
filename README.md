@@ -72,10 +72,20 @@
 
 ```bash
 cp .env.example .env      # 填上游配置，见下一节
-./start.sh                # 启动（首次自动建 .venv 并装依赖），打开 http://127.0.0.1:8000/
+./start.sh                # 启动（首次自动建 .venv，按 requirements.lock 校验哈希装依赖），打开 http://127.0.0.1:8000/
 ```
 
 停服务就是 `./start.sh stop` —— **不用再 `ps aux` 找 pid**，见下方「启动与停止」。
+
+### 依赖锁定
+
+运行依赖全部锁定在 `requirements.lock`：包含全部传递依赖与 sha256，`start.sh` 安装时启用
+`--require-hashes`，`requirements.txt` 只是输入清单。升级依赖时修改 `requirements.txt` 后重新生成锁文件
+（需要 [uv](https://docs.astral.sh/uv/)）：
+
+```bash
+uv pip compile requirements.txt --universal --python-version 3.10 --generate-hashes --no-annotate -o requirements.lock
+```
 
 打开后台后只有三步：
 
@@ -109,7 +119,7 @@ cp .env.example .env      # 填上游配置，见下一节
 整套服务只有一个入口：**`start.sh`**。不写子命令就是启动：
 
 ```bash
-./start.sh                # 启动（首次自动建 .venv + 装依赖）；等端口真的通了才返回
+./start.sh                # 启动（首次自动建 .venv + 按锁文件装依赖）；等端口真的通了才返回
 ./start.sh stop           # 停止（SIGTERM，15 秒不退才 SIGKILL）
 ./start.sh restart        # 重启（改了代码 / 配置后用）
 ./start.sh status         # 在不在跑、pid、地址、运行多久
@@ -128,7 +138,7 @@ cp .env.example .env      # 填上游配置，见下一节
 | 机器重启后遗留 pid | 照着旧 pid `kill` 可能**误杀别人的进程** | 核对命令行确实是本项目的 `main.py`，对不上就不动它 |
 | 关掉终端 / SSH 断开 | 进程可能被 SIGHUP 带走 | 独立会话运行，不受影响 |
 | 启动失败 | 只在终端滚过一段报错 | 直接打印**日志最后几行**，一眼看到错在哪 |
-| 换机器 / 新克隆 | 要先手动建 venv、装依赖 | 首次运行自动建 `.venv` 并装依赖（pip 缺失时自动改用 uv 或 Python 自带 ensurepip；不下载远程脚本） |
+| 换机器 / 新克隆 | 要先手动建 venv、装依赖 | 首次运行自动建 `.venv`，按 `requirements.lock` 校验哈希装依赖（pip 缺失时自动改用 uv 或 Python 自带 ensurepip；不下载远程脚本） |
 
 实现上就三件事：`data/app.pid` 里存 pid + 命令行 + 端口（只用于「下次核对是谁」，**不存任何凭据**）；
 停止走 SIGTERM → 超时 SIGKILL → 等端口释放；启动前确认没有实例在跑、端口也没被别人占。
@@ -1312,7 +1322,7 @@ start.sh           唯一入口：自动建 venv / 装依赖，再转给 ctl.py
 ctl.py             启停子命令实现（一般不用直接调）
 scripts/           一次性维护脚本（改上游名字、批量放开模型白名单等）
 app/secrets.py     账号 Cookie 的 AES-256-GCM 加解密（密钥文件 / 迁移）
-tests/             713 个单元 / 集成测试，全部离线运行
+tests/             741 个单元 / 集成测试，全部离线运行
 ```
 
 ## 测试

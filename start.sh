@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 闲鱼自动发货 —— 唯一入口。
 #
-#   ./start.sh           后台启动（首次自动建 .venv 并装依赖）
+#   ./start.sh           后台启动（首次自动建 .venv 并按锁文件装依赖）
 #   ./start.sh stop      停止
 #   ./start.sh restart   重启
 #   ./start.sh status    看状态
@@ -43,8 +43,8 @@ cd "$(resolve_dir "${BASH_SOURCE[0]}")"
 
 VENV_DIR=".venv"
 VENV_PY="$VENV_DIR/bin/python"
-REQ="requirements.txt"
-# 依赖标记：比 requirements.txt 新就说明装过了，不用再等 pip
+REQ="requirements.lock"
+# 依赖标记：比 requirements.lock 新就说明装过了，不用再等 pip
 STAMP="$VENV_DIR/.deps-installed"
 
 # 只在真终端上色：重定向到文件 / CI 里不要塞一堆转义符
@@ -82,7 +82,8 @@ find_python() {
 }
 
 # 装依赖：优先用 pip；没有 pip 时依次退到 uv、Python 自带的 ensurepip。
-# 不从网上抓 get-pip.py 执行：多一个远程脚本就多一条供应链攻击面。
+# 只安装 requirements.lock 并强制校验 sha256（--require-hashes）；
+# requirements.txt 只是输入清单。不从网上抓 get-pip.py 执行。
 # 为什么不能直接假设有 pip：用 `uv venv` 或 `python -m venv --without-pip` 建的
 # 虚拟环境根本没有 pip，一句 `python -m pip` 就报 "No module named pip"，
 # 而这个报错特别容易让人以为是网络或权限问题。
@@ -90,23 +91,23 @@ install_requirements() {
   local py="$1"
 
   if "$py" -m pip --version >/dev/null 2>&1; then
-    "$py" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-    "$py" -m pip install --quiet -r "$REQ"
+    # 不自动升级 pip：安装过程也只信任 requirements.lock 里的哈希。
+    "$py" -m pip install --quiet --require-hashes -r "$REQ"
     return $?
   fi
 
   if command -v uv >/dev/null 2>&1; then
     info "${C_DIM}（这个虚拟环境没有 pip，改用 uv 安装）${C_OFF}"
     # uv 默认把缓存写 ~/.cache/uv；只读 HOME / 容器里会失败，退到项目内的 .uvcache
-    if ! uv pip install --quiet --python "$py" -r "$REQ" 2>/dev/null; then
-      UV_CACHE_DIR="$PWD/.uvcache" uv pip install --quiet --python "$py" -r "$REQ" || return 1
+    if ! uv pip install --quiet --require-hashes --python "$py" -r "$REQ" 2>/dev/null; then
+      UV_CACHE_DIR="$PWD/.uvcache" uv pip install --quiet --require-hashes --python "$py" -r "$REQ" || return 1
     fi
     return 0
   fi
 
   info "${C_DIM}（没有 pip 也没有 uv，尝试用 Python 自带的 ensurepip）${C_OFF}"
   if "$py" -m ensurepip --upgrade >/dev/null 2>&1; then
-    "$py" -m pip install --quiet -r "$REQ"
+    "$py" -m pip install --quiet --require-hashes -r "$REQ"
     return $?
   fi
 
@@ -128,9 +129,9 @@ ensure_env() {
     return 0
   fi
 
-  info "${C_DIM}安装依赖（首次会慢一点）…${C_OFF}"
+  info "${C_DIM}安装依赖（首次会慢一点，按 requirements.lock 校验哈希）…${C_OFF}"
   install_requirements "$VENV_PY" \
-    || die "依赖安装失败。手动重试: uv pip install -r $REQ （或 $VENV_PY -m pip install -r $REQ）"
+    || die "依赖安装失败。手动重试: uv pip install --require-hashes -r $REQ （或 $VENV_PY -m pip install --require-hashes -r $REQ）"
   touch "$STAMP"
   ok "依赖已就绪"
 }
