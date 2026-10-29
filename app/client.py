@@ -311,6 +311,44 @@ def _looks_like_card_payload(payload: dict[str, Any]) -> bool:
         return False
 
 
+def _as_bool_local(value: Any) -> bool:
+    """把上游的 true / "true" / 1 统一成 bool。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in ("1", "true", "yes", "y")
+
+
+def _parse_sold_order(item: Any) -> dict[str, Any] | None:
+    """把卖家订单列表里的一项摊平成业务字段；没有订单号就跳过。"""
+    if not isinstance(item, dict):
+        return None
+    common = _as_dict_local(item.get("commonData"))
+    order_id = str(common.get("orderId") or "").strip()
+    if not order_id:
+        return None
+    buyer = _as_dict_local(item.get("buyerInfoVO"))
+    price = _as_dict_local(item.get("priceVO"))
+    item_info = _as_dict_local(item.get("itemVO"))
+    return {
+        "order_id": order_id,
+        "item_id": str(common.get("itemId") or "").strip(),
+        "order_status": str(common.get("orderStatus") or "").strip(),
+        "seller_rate_status": str(common.get("sellerRateStatus") or "").strip(),
+        "buyer_id": str(buyer.get("buyerId") or "").strip(),
+        "buyer_name": buyer_nick_from_session(buyer),
+        "amount": price.get("totalPrice"),
+        "item_title": str(item_info.get("title") or "").strip(),
+        "created_at": str(common.get("createTime") or "").strip(),
+        "paid_at": str(common.get("paySuccessTime") or "").strip(),
+        "consigned_at": str(common.get("consignTime") or "").strip(),
+        "finished_at": str(common.get("finishTime") or "").strip(),
+        "in_refund": _as_bool_local(common.get("inRefund")),
+        "raw": item,
+    }
+
+
 def _pick_order(response: dict[str, Any], order_id: str) -> dict[str, Any] | None:
     """在订单列表响应里找到指定订单，找不到返回 None。"""
     module = ((response.get("data") or {}).get("module")) or {}
@@ -859,14 +897,21 @@ class XianyuClient:
         logger.warning("评价订单 %s 失败：%s", order_id, ret or response)
         return False, ret or "评价接口没有返回 SUCCESS"
 
-    async def list_sold_orders(self, page_size: int = 20) -> list[dict[str, Any]]:
-        """拉最近的成交/待发货订单（评价轮询用）。
+    async def list_sold_orders_page(
+        self, page_number: int = 1, page_size: int = 50
+    ) -> dict[str, Any]:
+        """拉一页「卖家卖出的订单」（含历史成交 + 待发货）。
 
-        订单列表里 commonData.sellerRateStatus == "4" 表示卖家已评价过；
-        只返回带订单号的条目，具体能不能评由调用方按订单状态再过滤。
+        这是卖家中心「订单管理」用的接口，也是后台「从闲鱼同步」的数据源。
+        回包里的 nextPage 是布尔值，pageNumber 从 1 开始；totalCount 是筛选
+        条件下的总条数。这里不猜「最后一页」，交给 nextPage 决定要不要继续翻。
         """
+        page_number = max(1, int(page_number or 1))
+        # 线上实测 rowsPerPage 50 可用；再大没有意义，先收口到 50，避免哪天
+        # 上游悄悄改成最多 20 时一次请求直接报错。
+        page_size = max(1, min(int(page_size or 50), 50))
         payload = {
-            "pageNumber": 1,
+            "pageNumber": page_number,
             "rowsPerPage": page_size,
             "orderIds": "",
             "queryCode": "ALL",
@@ -876,36 +921,78 @@ class XianyuClient:
             resp = await self.mtop("mtop.taobao.idle.trade.merchant.sold.get", payload)
         except (RiskControl, CookieExpired, TokenExpired):
             raise
+        except httpx.HTTPError as exc:
+            logger.warning("拉成交订单列表网络异常（第 %s 页）：%s", page_number, exc)
+            raise XianyuError(f"成交订单列表网络异常：{exc}") from exc
         except XianyuError as exc:
-            logger.warning("拉成交订单列表失败：%s", exc)
-            return []
+            logger.warning("拉成交订单列表失败（第 %s 页）：%s", page_number, exc)
+            raise
         ret = _ret_text(resp)
         if "SUCCESS" not in ret.upper():
-            logger.warning("成交订单列表返回异常：%s", ret)
-            return []
+            raise XianyuError(f"成交订单列表返回异常：{ret or '没有 SUCCESS'}")
         module = _as_dict_local((resp.get("data") or {}).get("module"))
         items = module.get("items") or []
         orders: list[dict[str, Any]] = []
         for item in items:
-            if not isinstance(item, dict):
-                continue
-            common = _as_dict_local(item.get("commonData"))
-            order_id = str(common.get("orderId") or "").strip()
-            if not order_id:
-                continue
-            buyer = _as_dict_local(item.get("buyerInfoVO"))
-            price = _as_dict_local(item.get("priceVO"))
-            orders.append({
-                "order_id": order_id,
-                "item_id": str(common.get("itemId") or "").strip(),
-                "order_status": str(common.get("orderStatus") or "").strip(),
-                "seller_rate_status": str(common.get("sellerRateStatus") or "").strip(),
-                "buyer_id": str(buyer.get("buyerId") or "").strip(),
-                "buyer_name": buyer_nick_from_session(buyer),
-                "amount": price.get("totalPrice"),
-                "raw": item,
-            })
-        return orders
+            parsed = _parse_sold_order(item)
+            if parsed is not None:
+                orders.append(parsed)
+        try:
+            total_count = max(0, int(module.get("totalCount") or 0))
+        except (TypeError, ValueError):
+            total_count = 0
+        return {
+            "orders": orders,
+            "page_number": page_number,
+            "page_size": page_size,
+            "total_count": total_count,
+            "next_page": _as_bool_local(module.get("nextPage")),
+        }
+
+    async def list_all_sold_orders(
+        self, *, max_orders: int = 2000, page_size: int = 50
+    ) -> list[dict[str, Any]]:
+        """翻页拉完卖家的历史订单，按 order_id 去重。
+
+        只读接口。max_orders 是保险丝：正常店铺几百单，真遇到异常回包
+        （nextPage 永远 true）也不会无限翻下去。
+        """
+        max_orders = max(1, int(max_orders or 2000))
+        page_size = max(1, min(int(page_size or 50), 50))
+        seen: set[str] = set()
+        out: list[dict[str, Any]] = []
+        page = 1
+        while len(out) < max_orders:
+            result = await self.list_sold_orders_page(page, page_size)
+            batch = list(result.get("orders") or [])
+            for order in batch:
+                order_id = str(order.get("order_id") or "").strip()
+                if not order_id or order_id in seen:
+                    continue
+                seen.add(order_id)
+                out.append(order)
+                if len(out) >= max_orders:
+                    break
+            if not result.get("next_page") or not batch:
+                break
+            page += 1
+        return out
+
+    async def list_sold_orders(self, page_size: int = 20) -> list[dict[str, Any]]:
+        """拉最近一页成交/待发货订单（评价轮询用）。
+
+        订单列表里 commonData.sellerRateStatus == "4" 表示卖家已评价过；
+        只返回带订单号的条目，具体能不能评由调用方按订单状态再过滤。
+        """
+        try:
+            result = await self.list_sold_orders_page(1, page_size)
+        except (RiskControl, CookieExpired, TokenExpired):
+            raise
+        except XianyuError:
+            # 评价轮询是后台兜底任务，单次列表失败不该把循环打挂；
+            # 真正的登录失效/风控上面已经原样抛给上层退避了。
+            return []
+        return list(result.get("orders") or [])
 
     async def find_order(self, order_id: str) -> dict[str, Any] | None:
         """按订单号查卖家订单列表，拿到金额与状态。

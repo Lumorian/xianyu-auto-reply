@@ -7,6 +7,9 @@
 #   ./start.sh status    看状态
 #   ./start.sh logs -f   跟日志
 #   ./start.sh fg        前台运行，日志打在终端（调试用）
+#   ./start.sh backup    导出迁移包（换设备/备份）
+#   ./start.sh inspect   检查迁移包内容
+#   ./start.sh restore   从迁移包恢复（必须先 stop）
 #
 # 不给子命令时默认 start。真正干活的是 ctl.py —— 端口/pid/信号这些细节在 Python 里
 # 说得清也测得动；这里只负责准备环境、把解释器找对。
@@ -61,7 +64,7 @@ die()  { err "$*"; exit 1; }
 
 usage() {
   # 把文件头的注释当帮助输出，省得两份说明走样
-  sed -n "2,9p" "$0" | sed "s/^# \{0,1\}//"
+  sed -n "2,12p" "$0" | sed "s/^# \{0,1\}//"
 }
 
 find_python() {
@@ -173,6 +176,15 @@ case "$CMD" in
   fg|foreground)
     # 前台跑 = 原来的 main.py，直接 exec 替换掉当前 shell（Ctrl-C 就能停）
     exec "$VENV_PY" main.py "$@"
+    ;;
+  backup|bk)
+    exec "$VENV_PY" ctl.py backup "$@"
+    ;;
+  inspect|show)
+    exec "$VENV_PY" ctl.py inspect "$@"
+    ;;
+  restore)
+    exec "$VENV_PY" ctl.py restore "$@"
     ;;
   *)
     err "不认识的命令: $CMD"

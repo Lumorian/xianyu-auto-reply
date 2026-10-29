@@ -90,6 +90,16 @@ SEEN_RETRY_LIMIT = 3
 #: 这里先拦住明显异常的超长粘贴（也避免把前端撑爆）。
 MAX_CHAT_TEXT = 2000
 
+#: 闲鱼订单列表里「还没成交 / 已关闭」的状态：历史同步不能当销售额导入。
+NON_SALE_ORDER_STATUSES = frozenset({
+    "待付款",
+    "等待买家付款",
+    "未付款",
+    "交易关闭",
+    "交易取消",
+    "已关闭",
+})
+
 #: 闲鱼只允许撤回两分钟内发出的消息（服务端也会校验，这里先给个明确提示）
 RECALL_WINDOW_SECONDS = 120
 
@@ -1727,6 +1737,75 @@ class AccountWorker:
             await self._remember_buyer_name(*learned)
         logger.debug("[%s] 已同步会话 %s 的历史：%s 条", self.name, chat, handled)
         return handled
+
+    async def sync_order_history(self, max_orders: int = 2000) -> dict[str, Any]:
+        """从闲鱼卖家订单列表补拉历史订单记录（只读 + 只插入）。
+
+        用途：换设备/重装后本机库是空的，但闲鱼账号里的成交记录还在。
+        这里把闲鱼侧的订单号、商品、买家、金额、时间拉回来，作为「本机曾经
+        有这笔交易」的底账。它**不能**恢复本机才能知道的东西：发出去的卡密、
+        new-api 的 Key、订单用的规则、人工备注等，所以导入行统一标成
+        synced，详情里写明「仅同步订单记录」，不会伪装成本机发货成功。
+
+        已有记录一律不覆盖：本机已经 delivered / 退款 / 拦截的明细比闲鱼
+        列表更详细，用远端数据覆盖只会丢审计信息。新单后续被订单轮询命中时，
+        record_order 会正常把 synced 升级成真实发货状态。
+        """
+        if not self.is_connected:
+            raise XianyuError("账号当前未连接闲鱼，同步不了订单")
+        assert self.client is not None
+        orders = await self.client.list_all_sold_orders(max_orders=max_orders)
+        rows: list[dict[str, Any]] = []
+        ignored = 0
+        for order in orders:
+            order_id = str(order.get("order_id") or "").strip()
+            if not order_id:
+                ignored += 1
+                continue
+            remote_status = str(order.get("order_status") or "").strip() or "未知"
+            # 卖家订单列表默认会把待付款、交易关闭也带回来；这些不是成交，
+            # 导入成 synced 会让「成交/成交额」虚高，所以只补真正已付款的单。
+            if remote_status in NON_SALE_ORDER_STATUSES:
+                ignored += 1
+                continue
+            title = str(order.get("item_title") or "").strip()
+            detail_parts = [f"闲鱼状态：{remote_status}"]
+            if title:
+                detail_parts.append(f"商品：{title}")
+            if order.get("in_refund"):
+                detail_parts.append("退款中")
+            detail_parts.append("仅同步订单记录，本机无发货明细")
+            created_at = (
+                str(order.get("paid_at") or "").strip()
+                or str(order.get("created_at") or "").strip()
+                or now_iso()
+            )
+            rows.append({
+                "account_id": self.account_id,
+                "order_id": order_id,
+                "item_id": str(order.get("item_id") or "").strip() or None,
+                "buyer_id": str(order.get("buyer_id") or "").strip() or None,
+                "buyer_name": str(order.get("buyer_name") or "").strip() or None,
+                "amount_cny": amount_from_order_item(
+                    order.get("raw") or {}, settings.order_amount_unit
+                ),
+                "status": "synced",
+                "detail": "；".join(detail_parts),
+                "created_at": created_at,
+            })
+        inserted, skipped = await self.db.import_orders(rows)
+        logger.info(
+            "[%s] 从闲鱼同步订单：拉取 %s 单，新增 %s 单，已存在/跳过 %s 单，忽略未成交 %s 单",
+            self.name, len(orders), inserted, skipped, ignored,
+        )
+        return {
+            "account_id": self.account_id,
+            "account_name": self.name,
+            "fetched": len(orders),
+            "imported": inserted,
+            "skipped": skipped,
+            "ignored": ignored,
+        }
 
     # ------------------------------------------------ 拉取式收消息（兜底）
 
@@ -5082,6 +5161,45 @@ class WorkerManager:
         """按需补拉一个会话的历史消息。"""
         worker = self.require_worker(account_id)
         return await worker.sync_chat_history(chat_id, limit=limit)
+
+    async def sync_order_history(self, account_id: int | None = None) -> dict[str, Any]:
+        """从闲鱼补拉历史订单；不传 account_id 时同步所有在线账号。"""
+        if account_id is not None:
+            worker = self.require_worker(int(account_id))
+            result = await worker.sync_order_history()
+            return {
+                "accounts": [result],
+                "fetched": result["fetched"],
+                "imported": result["imported"],
+                "skipped": result["skipped"],
+                "ignored": int(result.get("ignored") or 0),
+                "errors": [],
+            }
+
+        workers = [w for w in self.workers.values() if w.is_connected]
+        if not workers:
+            raise LookupError("没有在线账号，先等账号连接成功再同步")
+        result: dict[str, Any] = {
+            "accounts": [], "fetched": 0, "imported": 0, "skipped": 0,
+            "ignored": 0, "errors": [],
+        }
+        for worker in workers:
+            try:
+                item = await worker.sync_order_history()
+            except (RiskControl, CookieExpired, TokenExpired):
+                raise
+            except Exception as exc:
+                logger.warning("[%s] 同步订单失败：%s", worker.name, exc)
+                result["errors"].append(f"{worker.name}：{exc}")
+                continue
+            result["accounts"].append(item)
+            result["fetched"] += int(item.get("fetched") or 0)
+            result["imported"] += int(item.get("imported") or 0)
+            result["skipped"] += int(item.get("skipped") or 0)
+            result["ignored"] += int(item.get("ignored") or 0)
+        if not result["accounts"]:
+            raise XianyuError("；".join(result["errors"]) or "同步订单失败")
+        return result
 
     def status(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []

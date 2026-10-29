@@ -19,8 +19,8 @@ import sys
 import time
 from pathlib import Path
 
-from app.config import BASE_DIR, settings
-from app.daemon import ControlError, ProcessController
+from app.config import BASE_DIR, resolve_cookie_key_path, settings
+from app.daemon import ControlError, ProcessController, port_in_use
 
 PID_FILE = BASE_DIR / "data" / "app.pid"
 
@@ -159,6 +159,159 @@ def _follow(path: Path, lines: int) -> int:
             return 0
 
 
+def _fmt_bytes(num: int) -> str:
+    value = float(max(0, num))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _print_manifest(manifest: dict) -> None:
+    db = manifest.get("db") or {}
+    counts = db.get("counts") or {}
+    print(f"  格式      {manifest.get('format')} v{manifest.get('version')}")
+    print(f"  导出时间  {manifest.get('created_at', '未知')}")
+    print(
+        "  数据      账号 {accounts} · 订单 {orders} · 消息 {messages} · 卡密 {cards}".format(
+            accounts=counts.get("accounts", 0),
+            orders=counts.get("orders", 0),
+            messages=counts.get("messages", 0),
+            cards=counts.get("cards", 0),
+        )
+    )
+    print(f"  含密钥    {'是' if manifest.get('includes_key') else '否'}")
+    print(f"  含媒体    {'是' if manifest.get('includes_media') else '否'}")
+    if manifest.get("path"):
+        print(f"  文件      {manifest['path']}")
+    if manifest.get("bytes"):
+        print(f"  大小      {_fmt_bytes(int(manifest['bytes']))}")
+
+
+def cmd_backup(args) -> int:
+    from app import backup
+
+    output = Path(args.output).expanduser() if args.output else (
+        BASE_DIR / "data" / "backups" / f"xianyu-backup-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+    )
+    if not output.is_absolute():
+        output = BASE_DIR / output
+    try:
+        manifest = backup.export_archive(
+            settings.db_path,
+            output,
+            key_path=resolve_cookie_key_path(settings),
+            media_dir=settings.media_dir,
+            include_key=args.with_key,
+            include_media=not args.no_media,
+        )
+    except backup.BackupError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    print("✓ 迁移包已导出")
+    _print_manifest(manifest)
+    if args.with_key:
+        print("  提醒      包里含 cookie.key（权限 0600），等于含登录态，别丢也别外传")
+    else:
+        print("  提醒      未包含 cookie.key：换设备恢复后账号需要重新扫码")
+    return 0
+
+
+def cmd_inspect(args) -> int:
+    from app import backup
+
+    archive = Path(args.archive).expanduser()
+    if not archive.is_absolute():
+        archive = BASE_DIR / archive
+    try:
+        manifest = backup.inspect_archive(archive)
+    except backup.BackupError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    print("✓ 迁移包格式正常")
+    manifest = {**manifest, "path": str(archive), "bytes": archive.stat().st_size}
+    _print_manifest(manifest)
+    return 0
+
+
+def cmd_restore(args) -> int:
+    from app import backup
+
+    ctl = _controller()
+    health = ctl.inspect()
+    if health.running:
+        print("✗ 服务正在运行。恢复会覆盖数据库，请先 ./start.sh stop", file=sys.stderr)
+        return 1
+    if port_in_use(settings.host, settings.port):
+        print(
+            f"✗ 端口 {settings.port} 上还有进程在监听，数据库可能正被打开。"
+            "请先确认并停掉服务（./start.sh status / stop）再恢复",
+            file=sys.stderr,
+        )
+        return 1
+
+    archive = Path(args.archive).expanduser()
+    if not archive.is_absolute():
+        archive = BASE_DIR / archive
+    try:
+        manifest = backup.inspect_archive(archive)
+    except backup.BackupError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    print("即将恢复这个迁移包：")
+    _print_manifest({**manifest, "path": str(archive), "bytes": archive.stat().st_size})
+    print(f"  恢复目标  {settings.db_path}")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("✗ 非交互环境请加 --yes 确认", file=sys.stderr)
+            return 1
+        answer = input("确认恢复？当前数据库会先备份成 *.pre-restore-* [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("已取消")
+            return 1
+
+    try:
+        result = backup.restore_archive(
+            archive,
+            settings.db_path,
+            key_path=resolve_cookie_key_path(settings),
+            media_dir=settings.media_dir,
+            restore_key=not args.without_key,
+            restore_media=not args.no_media,
+        )
+    except backup.BackupError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+
+    print("✓ 恢复完成")
+    print(
+        "  数据      账号 {accounts} · 订单 {orders} · 消息 {messages} · 卡密 {cards}".format(
+            accounts=result["counts"].get("accounts", 0),
+            orders=result["counts"].get("orders", 0),
+            messages=result["counts"].get("messages", 0),
+            cards=result["counts"].get("cards", 0),
+        )
+    )
+    if result["pre_restore"]:
+        print(f"  恢复前快照 {result['pre_restore']}")
+    key_status = result["key_status"]
+    if result["key_restored"]:
+        print("  密钥      cookie.key 已一起恢复，登录态可直接用")
+    elif key_status == "ok":
+        print("  密钥      沿用本机现有 cookie.key，校验通过")
+    elif key_status == "missing_key":
+        print("  密钥      包里没有 cookie.key，账号需要重新扫码")
+    elif key_status == "no_encrypted_cookies":
+        print("  密钥      库里没有加密 Cookie，不需要密钥")
+    else:
+        print(f"  密钥      ⚠ 本机密钥解不开新库（{key_status}），账号需要重新扫码")
+    if result["media_restored"]:
+        print("  媒体      内置图片/聊天媒体已合并")
+    print("  下一步     ./start.sh start")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ctl.py",
@@ -185,6 +338,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_logs.add_argument("-f", "--follow", action="store_true", help="持续输出新日志")
     p_logs.add_argument("-n", "--lines", type=int, default=40, help="先打印最后几行（默认 40）")
     p_logs.set_defaults(func=cmd_logs)
+
+    p_backup = sub.add_parser("backup", help="导出数据迁移包（换设备/备份用）")
+    p_backup.add_argument("-o", "--output", help="输出文件（默认 data/backups/xianyu-backup-<时间>.tar.gz）")
+    p_backup.add_argument("--with-key", action="store_true",
+                          help="把 cookie.key 一起打包（含登录态；文件权限 0600）")
+    p_backup.add_argument("--no-media", action="store_true", help="不打包 data/media 里的图片和视频")
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_inspect = sub.add_parser("inspect", help="检查迁移包里有什么，不落盘")
+    p_inspect.add_argument("archive", help="迁移包路径（.tar.gz）")
+    p_inspect.set_defaults(func=cmd_inspect)
+
+    p_restore = sub.add_parser("restore", help="从迁移包恢复数据（必须先停服务）")
+    p_restore.add_argument("archive", help="迁移包路径（.tar.gz）")
+    p_restore.add_argument("--without-key", action="store_true",
+                           help="只恢复业务数据，不导入包里的 cookie.key")
+    p_restore.add_argument("--no-media", action="store_true", help="不恢复媒体文件")
+    p_restore.add_argument("-y", "--yes", action="store_true", help="跳过确认（脚本里用）")
+    p_restore.set_defaults(func=cmd_restore)
 
     return parser
 

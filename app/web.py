@@ -1083,6 +1083,22 @@ def create_app(db: Database | None = None, manager: WorkerManager | None = None)
     async def list_orders(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
         return await database.list_orders(limit)
 
+    @app.post("/api/orders/sync", dependencies=guard)
+    async def sync_orders(
+        request: Request,
+        account_id: int | None = Query(None, description="只同步这个账号；不传则同步全部在线账号"),
+    ) -> dict[str, Any]:
+        """从闲鱼卖家订单列表补拉历史订单（只读，不发送任何消息）。"""
+        _throttle_outbound(request, "同步订单")
+        try:
+            return await mgr(request).sync_order_history(account_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except XianyuError as exc:
+            raise HTTPException(status_code=502, detail=f"同步失败：{exc}") from exc
+
     @app.get("/api/messages", dependencies=guard)
     async def list_messages(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
         """消息流水（最新在前）。

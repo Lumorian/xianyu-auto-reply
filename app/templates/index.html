@@ -798,10 +798,12 @@ td.entries-cell > b{display:inline-block;max-width:190px;overflow:hidden;text-ov
           <div class="card-h">
             <div><h2>发货记录</h2><p class="sub" id="orders-count">—</p></div>
             <div class="row" style="flex:0 0 auto;gap:8px">
+              <button class="btn primary" id="orders-sync" onclick="syncOrders()" title="只拉取已付款的订单；待付款/交易关闭会跳过">从闲鱼同步</button>
               <input class="in" id="orders-q" placeholder="搜订单号 / 买家 / 商品" style="width:230px" oninput="renderOrders()" />
               <select class="in" id="orders-status" style="width:128px" onchange="renderOrders()">
                 <option value="">全部状态</option>
                 <option value="delivered">已发货</option>
+                <option value="synced">闲鱼同步</option>
                 <option value="provisioned">已备货待发送</option>
                 <option value="sending">发送中</option>
                 <option value="send_unknown">发送结果未知</option>
@@ -2081,6 +2083,7 @@ function loginHint(st) {
 function orderPill(status) {
   var map = {
     delivered: ["ok", "已发货"],
+    synced: ["info", "闲鱼同步"],
     provisioned: ["warn", "已备货待发送"],
     sending: ["info", "发送中"],
     send_unknown: ["warn", "结果未知·需人工核对"],
@@ -2102,18 +2105,22 @@ function orderPill(status) {
 }
 
 function renderStats() {
-  var delivered = S.orders.filter(function (o) { return o.status === "delivered"; });
+  // 「成交」包含本机实际发货的 delivered，以及从闲鱼补拉回来的 synced。
+  // 后者只是历史底账（换设备后本机没有卡密/Key 明细），不能算进发货失败。
+  var sales = S.orders.filter(function (o) { return o.status === "delivered" || o.status === "synced"; });
   var now = new Date();
   var todayKey = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate());
-  var today = delivered.filter(function (o) { return String(o.created_at || "").indexOf(todayKey) === 0; });
+  var today = sales.filter(function (o) { return String(o.created_at || "").indexOf(todayKey) === 0; });
   var sumToday = today.reduce(function (a, o) { return a + (Number(o.amount_cny) || 0); }, 0);
-  var sumAll = delivered.reduce(function (a, o) { return a + (Number(o.amount_cny) || 0); }, 0);
+  var sumAll = sales.reduce(function (a, o) { return a + (Number(o.amount_cny) || 0); }, 0);
   var stock = S.stock.reduce(function (a, s) { return a + (Number(s.available) || 0); }, 0);
   var online = S.status.filter(function (s) { return s.status === "online"; }).length;
-  var failed = S.orders.filter(function (o) { return o.status !== "delivered"; }).length;
+  var failed = S.orders.filter(function (o) {
+    return o.status !== "delivered" && o.status !== "synced";
+  }).length;
 
   var cards = [
-    { k: "今日发货", v: nfmt(today.length), u: "单", s: "累计 " + nfmt(delivered.length) + " 单", cls: "k-ok" },
+    { k: "今日成交", v: nfmt(today.length), u: "单", s: "累计 " + nfmt(sales.length) + " 单", cls: "k-ok" },
     { k: "今日成交额", v: yuan(sumToday), u: "", s: "累计 " + yuan(sumAll), cls: "" },
     { k: "在线账号", v: nfmt(online), u: "/ " + nfmt(S.accounts.length), s: online ? "长连接正常" : "没有在线账号", cls: "k-info" },
     { k: "可用卡密", v: nfmt(stock), u: "条", s: failed ? (failed + " 单待处理") : "无需处理", cls: "" }
@@ -2297,7 +2304,8 @@ function renderOrders() {
   var rows = S.orders.filter(function (o) {
     if (st && o.status !== st) return false;
     if (!q) return true;
-    var hay = [o.order_id, o.item_id, o.buyer_name, o.buyer_id, o.card_code, o.key_order_id].join(" ").toLowerCase();
+    var hay = [o.order_id, o.item_id, o.buyer_name, o.buyer_id, o.card_code, o.key_order_id, o.detail]
+      .join(" ").toLowerCase();
     return hay.indexOf(q) >= 0;
   });
   document.getElementById("orders-count").textContent = S.orders.length
@@ -2325,7 +2333,30 @@ function renderOrders() {
       "<td>" + orderPill(o.status) + "</td>" +
       "<td class='muted tiny' style='max-width:280px'>" + esc(detail || "—") + "</td>" +
       chatCell + "</tr>";
-  }).join("") : emptyRow(8, q || st ? "没有匹配的记录" : "还没有发货记录", "📦");
+  }).join("") : emptyRow(8, q || st ? "没有匹配的记录" : "还没有发货记录 —— 点右上角「从闲鱼同步」拉取闲鱼历史订单", "📦");
+}
+
+var ORDERS_SYNCING = false;
+async function syncOrders() {
+  if (ORDERS_SYNCING) return;
+  var btn = document.getElementById("orders-sync");
+  var label = btn ? btn.textContent : "";
+  ORDERS_SYNCING = true;
+  if (btn) { btn.disabled = true; btn.textContent = "同步中…"; }
+  try {
+    var r = await api("/api/orders/sync", { method: "POST" });
+    var msg = "同步完成：新增 " + nfmt(r.imported || 0) + " 单";
+    if (r.skipped) msg += "，已存在 " + nfmt(r.skipped) + " 单";
+    if (r.ignored) msg += "，跳过 " + nfmt(r.ignored) + " 单（未付款/已关闭）";
+    if (r.errors && r.errors.length) msg += "；" + r.errors.length + " 个账号失败";
+    toast(msg);
+    await refresh(false);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    ORDERS_SYNCING = false;
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
 }
 
 function renderCards() {
@@ -3504,7 +3535,7 @@ function messagePreview(m) {
 }
 function orderStatusText(status) {
   var map = {
-    delivered: "已发货", provisioned: "已备货待发送", sending: "发送中",
+    delivered: "已发货", synced: "闲鱼同步", provisioned: "已备货待发送", sending: "发送中",
     send_unknown: "发送结果未知", send_failed: "发送失败", upstream_failed: "上游失败",
     topping_up: "正在充值", awaiting_key: "等买家发旧订单号",
     topup_failed: "充值失败", topup_unknown: "充值结果未知",
@@ -3555,7 +3586,13 @@ function notifyAfterRefresh() {
   NOTIFY_SEEN.msg = Math.max(NOTIFY_SEEN.msg, maxMsg);
   NOTIFY_SEEN.order = Math.max(NOTIFY_SEEN.order, maxOrder);
   if (msgs.length) notifyNewMessages(msgs);
-  if (orders.length) notifyNewOrders(orders);
+  // 手动「从闲鱼同步」会一次性插入很多历史订单，不能再当成实时新单弹一遍；
+  // 把已读水位推到最新，红点也不留。
+  if (ORDERS_SYNCING && maxOrder > (ORDER_SEEN || 0)) {
+    ORDER_SEEN = maxOrder;
+    storeSet(ORDER_SEEN_KEY, String(ORDER_SEEN));
+  }
+  if (orders.length && !ORDERS_SYNCING) notifyNewOrders(orders);
 }
 function notifyNewMessages(rows) {
   var groups = {}, keys = [];

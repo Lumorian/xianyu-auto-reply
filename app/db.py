@@ -2174,6 +2174,56 @@ class Database:
         finally:
             await conn.close()
 
+    async def import_orders(self, rows: Iterable[dict[str, Any]]) -> tuple[int, int]:
+        """批量导入外部（闲鱼）订单记录，只插入、绝不覆盖本机已有记录。
+
+        返回 (新增条数, 跳过条数)。跳过包括三种情况：没有 order_id、
+        缺少 account_id/status 的坏数据，以及 (account_id, order_id) 已经存在。
+
+        为什么不用 record_order：那个函数是「发货流水」的写入入口，会把同一单
+        的失败记录覆盖成新状态；历史同步只是补一张「闲鱼上确实有这笔交易」的
+        底账，不能碰本机已经发货/退款/拦截的明细。因此这里用 INSERT OR IGNORE，
+        已存在的行一个字段都不动。
+        """
+        prepared: list[tuple[list[str], tuple[Any, ...]]] = []
+        skipped = 0
+        for fields in rows:
+            if not isinstance(fields, dict):
+                skipped += 1
+                continue
+            row = dict(fields)
+            if not str(row.get("order_id") or "").strip() \
+                    or not row.get("account_id") \
+                    or not str(row.get("status") or "").strip():
+                skipped += 1
+                continue
+            row.setdefault("created_at", now_iso())
+            names = self._checked_columns(row, self._ORDER_COLUMNS)
+            prepared.append((names, tuple(row.values())))
+
+        inserted = 0
+        conn = await self.connect()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            for names, values in prepared:
+                columns = ", ".join(names)
+                placeholders = ", ".join("?" for _ in names)
+                cur = await conn.execute(
+                    f"INSERT OR IGNORE INTO orders ({columns}) VALUES ({placeholders})",  # noqa: S608 - 列名已过白名单
+                    values,
+                )
+                if cur.rowcount:
+                    inserted += 1
+                else:
+                    skipped += 1
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+        return inserted, skipped
+
     async def list_orders(self, limit: int = 100) -> list[dict[str, Any]]:
         return await self.fetch_all("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
 
