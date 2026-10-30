@@ -106,9 +106,20 @@ def test_session_arouse_is_skipped():
     assert msg is None
 
 
-def test_own_message_is_skipped():
+def test_own_message_is_recorded():
+    """多端同步回来的自己消息要能落库，但不能当买家消息处理。"""
     msg = parse_message(nested(text="你好", sender=MY), my_id=MY)
-    assert msg is None
+    assert msg is not None
+    assert msg.from_me is True
+    assert msg.content == "你好"
+
+
+def test_own_plain_text_with_paid_keyword_is_not_buyer():
+    """自己在聊天框里打「已付款」不能伪装成买家付款卡片。"""
+    msg = parse_message(nested(text="[我已付款，等待你发货]", sender=MY), my_id=MY)
+    assert msg is not None
+    assert msg.from_me is True
+    assert msg.sender_id == MY
 
 
 def test_read_receipt_is_skipped():

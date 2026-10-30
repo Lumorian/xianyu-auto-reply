@@ -142,6 +142,11 @@ def _url_param(url: str, name: str) -> str:
     return tail.strip()
 
 
+def _normalize_user_id(value: Any) -> str:
+    """去掉 @goofish 域名后缀和首尾空白，统一比较/落库用的用户 ID。"""
+    return str(value or "").split("@", 1)[0].strip()
+
+
 def _dedupe_lines_local(texts: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -1242,6 +1247,7 @@ class XianyuClient:
         买家 / 商品 / 订单信息（比从正文里猜靠谱）。
         """
         session_ext = session_ext or {}
+        self_id = _normalize_user_id(self.user_id)
         extension = _as_dict_local(message.get("extension"))
         content = _as_dict_local(message.get("content"))
         custom = _as_dict_local(content.get("custom"))
@@ -1272,18 +1278,27 @@ class XianyuClient:
             return None
 
         item_id = str(session_ext.get("itemId") or "") or _url_param(reminder_url, "itemId")
-        peer_id = _url_param(reminder_url, "peerUserId") or str(session_ext.get("extUserId") or "")
+        # 会话 extension 的 extUserId 是权威的对面买家；reminderUrl 的
+        # peerUserId 在「自己发的」消息里指向通知接收方（就是我自己），不能先用。
+        peer_id = _normalize_user_id(session_ext.get("extUserId")) or _normalize_user_id(
+            _url_param(reminder_url, "peerUserId")
+        )
+        if peer_id == self_id:
+            peer_id = ""
 
-        sender_id = str(extension.get("senderUserId") or "").split("@")[0].strip()
+        sender_id = _normalize_user_id(extension.get("senderUserId"))
         sender = _as_dict_local(message.get("sender"))
         if not sender_id:
-            sender_id = str(sender.get("uid") or "").split("@")[0].strip()
+            sender_id = _normalize_user_id(sender.get("uid"))
 
         # 对方是买家还是我自己：卖家自己发的（多端同步）不该触发自动回复。
         # 自己发的那条里 reminderUrl 的 peerUserId 指向通知接收方（就是我自己），
-        # 不能当买家 ID 用；这种情况留空，反正整条消息会被跳过。
-        from_me = bool(sender_id) and sender_id == self.user_id
-        buyer_id = "" if from_me else (sender_id or (peer_id if peer_id != self.user_id else ""))
+        # 不能当买家 ID 用；peer_id 单独留给聊天记录落库用。
+        from_me = bool(sender_id) and sender_id == self_id
+        buyer_id = "" if from_me else (sender_id or peer_id)
+        # 自己发的消息也靠 peer_id 落库，否则后台只能看到买家的话，
+        # 看不到卖家在闲鱼 App 里回的那句。
+        chat_peer_id = peer_id
 
         # 订单号的来源决定它可不可信：会话 extension / reminderUrl 是服务端字段，
         # 正文（text）和 reminderContent 是买家写的，只能兜底。
@@ -1325,8 +1340,8 @@ class XianyuClient:
         if from_me and is_paid_trigger(text) and (
             _looks_like_card_payload(inner) or content_type in (25, 26, 36)
         ):
-            peer = str(session_ext.get("extUserId") or "").strip()
-            if peer and peer != self.user_id:
+            peer = _normalize_user_id(session_ext.get("extUserId"))
+            if peer and peer != self_id:
                 buyer_id = peer
                 from_me = False
 
@@ -1346,6 +1361,8 @@ class XianyuClient:
             # 后台拿它把「商品 1093…」换成商品名。历史和推送路径没有就留空。
             "item_title": " ".join(str(session_ext.get("itemTitle") or "").split()),
             "buyer_id": buyer_id,
+            # 对面买家 ID：自己发的消息 buyer_id 为空，落库时用这个补。
+            "peer_id": chat_peer_id,
             # reminderTitle 在交易卡片里是标题（「等待你发货」），不是昵称。
             # 会话 extension 里带的是对方资料，那是真名，优先用它；
             # 两处都没有才退回空串，让上层再去找（聊天记录 / 订单）。

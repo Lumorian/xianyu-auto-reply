@@ -230,6 +230,11 @@ def _preview(text: str, limit: int = 120) -> str:
     return one_line[:limit] + f"…（共 {len(one_line)} 字）"
 
 
+def _clean_user_id(value: Any) -> str:
+    """统一用户 ID：去掉 @goofish 之类的域后缀和首尾空白。"""
+    return str(value or "").split("@", 1)[0].strip()
+
+
 #: debug dump 里需要打码的字段：买家昵称/头像/联系方式，以及各种可定位 ID。
 #: 日志经常被截图、贴群、进工单，完整负载等于把买家信息永久留档。
 _PII_FIELD_RE = re.compile(
@@ -866,7 +871,9 @@ class AccountWorker:
     async def _handle_payload(self, payload: dict[str, Any]) -> None:
         import json as _json
 
-        msg = parse_message(payload, my_id=self.client.user_id if self.client else "")
+        msg = parse_message(
+            payload, my_id=_clean_user_id(self.client.user_id if self.client else "")
+        )
         if msg is None:
             chat_id = unread_sync_chat_id(payload)
             if chat_id:
@@ -892,7 +899,11 @@ class AccountWorker:
                                 _json.dumps(redact_payload(payload), ensure_ascii=False)[:2000])
                 note_unparsed(payload)
             return
-        if self.client and msg.sender_id == self.client.user_id:
+        # 卖家自己在闲鱼 App / 网页里发的消息也会推过来。以前直接 return，
+        # 后台就永远看不到自己发出去的那半段对话。现在只记聊天记录，
+        # 绝不能进入 _process_incoming（否则会自己回自己）。
+        if msg.from_me:
+            await self._record_outgoing_message(msg)
             return
 
         if settings.debug_payload:
@@ -927,6 +938,62 @@ class AccountWorker:
             # 发货不会重试）。失败次数太多的就不再重试，免得一条坏消息刷屏。
             await self._forget_seen(seen_key)
             raise
+
+    async def _record_outgoing_message(self, msg: IncomingMessage) -> None:
+        """把卖家自己发的消息记进聊天流水（只记录，不触发任何自动动作）。
+
+        自己发出去的消息没有买家 sender_id，落库时统一挂到会话对端买家名下，
+        和后台手动发送、自动回复的流水保持一致；聊天界面据此渲染右侧气泡。
+        """
+        chat_id = str(msg.chat_id or "").strip()
+        if not chat_id:
+            logger.warning("[%s] 忽略没有会话 ID 的己方消息：%r", self.name, msg.message_id)
+            return
+
+        own_id = _clean_user_id(self.client.user_id if self.client else "")
+        peer = _clean_user_id(msg.peer_id)
+        if peer and peer == own_id:
+            # 异常/历史脏数据可能把卖家自己当成对端，绝不能写进 sender_id，
+            # 否则会话列表和后续回消息都会指向自己。
+            logger.warning("[%s] 己方消息的对端是自己，已忽略：%s", self.name, peer)
+            peer = ""
+        if not peer:
+            peer = _clean_user_id(await self.db.chat_peer_id(self.account_id, chat_id))
+            if peer == own_id:
+                peer = ""
+        name = ""
+        if peer:
+            try:
+                name = await self.db.known_buyer_name(self.account_id, peer) or ""
+            except Exception:
+                name = ""
+        if not name:
+            name = "买家" if peer else ""
+
+        await self.db.log_synced_message(
+            account_id=self.account_id,
+            chat_id=chat_id,
+            sender_id=peer,
+            sender_name=name,
+            item_id=msg.item_id,
+            item_title=msg.item_title,
+            order_id=msg.order_id,
+            content=msg.content,
+            kind="outgoing",
+            message_type=msg.message_type,
+            media_url=msg.media_url or None,
+            media_thumb_url=msg.media_thumb_url or None,
+            media_width=msg.media_width,
+            media_height=msg.media_height,
+            media_duration=msg.media_duration,
+            external_id=msg.message_id or None,
+            read_at=now_iso(),
+            created_at=iso_from_ms(msg.created_at),
+        )
+        # 人都在闲鱼里回消息了，这个会话显然已经看过；顺手清掉后台的红点。
+        await self.db.mark_chat_read(self.account_id, chat_id)
+        logger.debug("[%s] 记录自己发出的消息（会话 %s，买家 %s）",
+                     self.name, chat_id, peer or "-")
 
     async def _forget_seen(self, seen_key: str) -> None:
         """异常路径专用：撤销 seen 标记，让这条消息下一轮还能重来。
@@ -1709,8 +1776,10 @@ class AccountWorker:
         为什么需要：轮询只保证「每个会话最后一条」，后台打开一个久未打开的会话时
         手上可能只有几行。这里补一次最近 N 条（一次 WS 往返），靠 messageId 去重。
 
-        只写**收到的**消息：我们发出去的（自动回复、发货、后台手动回复）
-        在发送那一刻已经记过流水了，再从历史里补一遍就会变成两条一模一样的气泡。
+        收到的和自己发出去的都记：卖家在闲鱼 App / 网页里回的消息，本机
+        只有靠这里补拉才能看到。自己消息只写聊天流水，不会触发自动回复；
+        发送那一刻已经记过的行，靠 messageId 和「同方向 + 同内容 + 3 分钟」
+        兜底去重，不会再冒出第二条气泡。
         """
         chat = str(chat_id or "").strip()
         if not chat:
@@ -1725,19 +1794,29 @@ class AccountWorker:
         # 历史接口通常是从新到旧；先按时间正序写库，聊天界面才是正常对话顺序
         items.sort(key=lambda item: int(item.get("created_at") or 0))
 
-        peer = await self.db.chat_peer_id(self.account_id, chat)
+        own_id = _clean_user_id(self.client.user_id if self.client else "")
+        peer = _clean_user_id(await self.db.chat_peer_id(self.account_id, chat))
+        if peer == own_id:
+            # 老库里可能残留「对端=自己」的脏行，不能把历史消息挂到自己名下。
+            peer = ""
         known_name = await self.db.known_buyer_name(self.account_id, peer) if peer else None
         handled = 0
         learned: tuple[str, str] | None = None
         for data in items:
-            if data.get("from_me"):
-                continue
             content = str(data.get("content") or "").strip()
             if not content and not data.get("media_url"):
                 continue
-            buyer_id = str(data.get("buyer_id") or peer or "")
+            from_me = bool(data.get("from_me"))
+            # 自己发的消息没有买家 sender_id，用会话对端兜底，才能挂到同一个会话下
+            buyer_id = _clean_user_id(data.get("buyer_id") or data.get("peer_id") or peer)
+            if buyer_id == own_id:
+                if not from_me:
+                    logger.warning("[%s] 历史消息的发送方是自己，按脏数据跳过：%s",
+                                   self.name, data.get("message_id") or "-")
+                    continue
+                buyer_id = peer or ""
             buyer_name = str(data.get("buyer_name") or "").strip() or known_name or ""
-            if buyer_id and buyer_name and not is_placeholder_name(buyer_name):
+            if not from_me and buyer_id and buyer_name and not is_placeholder_name(buyer_name):
                 learned = (buyer_id, buyer_name)
             await self.db.log_synced_message(
                 account_id=self.account_id,
@@ -1748,7 +1827,7 @@ class AccountWorker:
                 item_title=str(data.get("item_title") or ""),
                 order_id=data.get("order_id") or None,
                 content=content,
-                kind="incoming",
+                kind="outgoing" if from_me else "incoming",
                 message_type=str(data.get("message_type") or "text"),
                 media_url=data.get("media_url") or None,
                 media_thumb_url=data.get("media_thumb_url") or None,
@@ -2000,9 +2079,16 @@ class AccountWorker:
         handled = 0
         for msg_data, key in ordered:
             fresh.append(key)
-            if msg_data.get("from_me"):
-                continue
             if not str(msg_data.get("content") or "").strip() and not msg_data.get("media_url"):
+                continue
+            if msg_data.get("from_me"):
+                outgoing = self._to_incoming(msg_data, outgoing=True)
+                if outgoing is None:
+                    continue
+                # 自己发的消息只记流水：不能进 _process_incoming，
+                # 否则自动回复/发货会把卖家自己的话当成买家需求。
+                await self._record_outgoing_message(outgoing)
+                handled += 1
                 continue
             msg = self._to_incoming(msg_data)
             if msg is None:
@@ -2038,9 +2124,19 @@ class AccountWorker:
                         handled)
         return handled
 
-    def _to_incoming(self, data: dict[str, Any]) -> IncomingMessage | None:
-        sender_id = str(data.get("buyer_id") or "")
-        if not sender_id:
+    def _to_incoming(self, data: dict[str, Any], *, outgoing: bool = False) -> IncomingMessage | None:
+        own_id = _clean_user_id(self.client.user_id if self.client else "")
+        sender_id = _clean_user_id(data.get("buyer_id"))
+        peer_id = _clean_user_id(data.get("peer_id"))
+        if peer_id == own_id:
+            peer_id = ""
+        if outgoing:
+            # 自己发的消息 buyer_id 为空，先取会话对端；仍为空也允许，
+            # 由 _record_outgoing_message 从已知会话里回退。
+            sender_id = sender_id or peer_id
+            if sender_id == own_id:
+                sender_id = ""
+        elif not sender_id:
             return None
         # custom_type：1 真人文本、2 图片、0 未知；其余都是系统消息/卡片
         try:
@@ -2058,6 +2154,8 @@ class AccountWorker:
             created_at=int(data.get("created_at") or 0),
             raw=data.get("raw") or {},
             message_id=str(data.get("message_id") or ""),
+            from_me=outgoing,
+            peer_id=peer_id,
             # custom.type 在部分版本里都是 1；真正区分卡片的是内容自己的
             # contentType（25 评价请求 / 26 交易卡片 / 36 卡片）。
             is_system_card=content_type not in (0, 1, 2),

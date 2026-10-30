@@ -128,6 +128,33 @@ def test_parse_conversation_marks_own_messages():
     assert parsed["from_me"] is True
     # 自己发的那条里 peerUserId 指向的是通知接收方（我自己），不能当买家 ID
     assert parsed["buyer_id"] == ""
+    # 但落库时要把消息挂到会话对面的买家名下
+    assert parsed["peer_id"] == BUYER
+
+
+def test_parse_conversation_normalizes_peer_id_domain_suffix():
+    """会话 extension 的 extUserId 可能带域后缀，落库前必须归一化。"""
+    conv = conversation()
+    conv["singleChatUserConversation"]["singleChatConversation"]["extension"][
+        "extUserId"
+    ] = BUYER + "@goofish"
+    parsed = client()._parse_conversation(conv)
+    assert parsed is not None
+    assert parsed["peer_id"] == BUYER
+    assert parsed["buyer_id"] == BUYER
+
+
+def test_parse_conversation_drops_self_peer_with_domain_suffix():
+    """extUserId 被污染成自己（带域后缀）时不能返回自己当对端。"""
+    conv = conversation(sender=ME + "@goofish")
+    conv["singleChatUserConversation"]["singleChatConversation"]["extension"][
+        "extUserId"
+    ] = ME + "@goofish"
+    parsed = client()._parse_conversation(conv)
+    assert parsed is not None
+    assert parsed["from_me"] is True
+    assert parsed["buyer_id"] == ""
+    assert parsed["peer_id"] == ""
 
 
 def test_parse_conversation_skips_conversation_without_message():
@@ -422,10 +449,19 @@ async def test_own_message_does_not_trigger_reply(db, fast):
     await worker._poll_recent_messages()
     await finish_replies(worker)
 
-    worker.client.conversations = [conversation(sender=ME, message_id="mine-1", nick="_示例_")]
+    worker.client.conversations = [
+        conversation(sender=ME, message_id="mine-1", nick="_示例_", text="我自己回的")
+    ]
     await worker._poll_recent_messages()
     await finish_replies(worker)
     assert worker.client.sent == []
+
+    # 自己发的消息要进聊天流水（右侧气泡），但绝不能触发自动回复
+    rows = await db.list_chat_messages(worker.account_id, CHAT)
+    own = [row for row in rows if row["external_id"] == "mine-1"]
+    assert len(own) == 1
+    assert own[0]["kind"] == "outgoing"
+    assert own[0]["content"] == "我自己回的"
 
 
 async def test_polling_can_be_disabled(db, fast, monkeypatch):
@@ -538,9 +574,15 @@ async def test_history_does_not_reprocess_own_or_system_messages(db, fast):
 
     handled = await worker._poll_recent_messages()
     await finish_replies(worker)
-    # 系统消息算「处理过」（记进流水），但没有产生任何自动回复
-    assert handled == 1
+    # 系统消息和自己发的消息都算「处理过」（记进流水），但没有产生任何自动回复
+    assert handled == 2
     assert worker.client.sent == []
+
+    rows = await db.list_chat_messages(worker.account_id, CHAT)
+    own = [row for row in rows if row["external_id"] == "o-1"]
+    assert len(own) == 1
+    assert own[0]["kind"] == "outgoing"
+    assert own[0]["content"] == "我自己的回复"
 
     # 再拉一轮：两条都已记账，不该再被当成新消息
     assert await worker._poll_recent_messages() == 0

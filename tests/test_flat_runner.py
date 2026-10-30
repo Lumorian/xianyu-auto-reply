@@ -71,12 +71,12 @@ def frame_with(payload: dict) -> str:
     })
 
 
-def flat(content, *, owner=MY, ext=BUYER):
+def flat(content, *, owner=MY, ext=BUYER, receivers=None):
     return {
         "chatType": 1, "incrementType": 1, "sessionId": SESSION,
         "operation": {
             "content": content,
-            "receiverIds": [MY],
+            "receiverIds": [MY] if receivers is None else receivers,
             "sessionInfo": {
                 "sessionId": SESSION, "ownerUserId": owner, "createTime": 1777287861000,
                 "extensions": {"itemId": ITEM_ID, "itemTitle": "dsv4.1f1017",
@@ -86,13 +86,14 @@ def flat(content, *, owner=MY, ext=BUYER):
     }
 
 
-def paid_card():
+def paid_card(**kwargs):
     card = {"contentType": 26, "dxCard": {"item": {"main": {
         "exContent": {"title": "我已付款，等待你发货"},
         "targetUrl": "fleamarket://order_detail?id=" + ORDER_ID + "&role=seller",
     }}}}
     return flat({"contentType": 26,
-                 "custom": {"type": 26, "data": base64.b64encode(json.dumps(card).encode()).decode()}})
+                 "custom": {"type": 26, "data": base64.b64encode(json.dumps(card).encode()).decode()}},
+                **kwargs)
 
 
 async def build(db: Database):
@@ -152,3 +153,28 @@ async def test_session_arouse_does_not_pollute_message_log(db):
     worker, _, _ = await build(db)
     await worker._on_frame(frame_with(flat({"contentType": 8, "sessionArouse": {"sessionArouseInfo": {}}})))
     assert await db.list_messages() == []
+
+
+async def test_real_flat_own_paid_card_is_logged_not_delivered(db):
+    """卖家从闲鱼 App 发出的消息被 flat 推送时，只能落 outgoing，绝不能发货。"""
+    await db.save_rule({
+        "name": "按金额", "item_id": ITEM_ID, "enabled": True, "mode": "upstream",
+        "content": "{card}", "auto_confirm": True, "priority": 0, "remark": "",
+        "usd_multiplier": 1.0, "fixed_usd": 0.0,
+    })
+    worker, provisioner, _ = await build(db)
+
+    payload = paid_card(owner=MY, ext=BUYER, receivers=[BUYER])
+    await worker._on_frame(frame_with(payload))
+    await worker._on_frame(frame_with(payload))
+
+    assert provisioner.calls == []
+    assert worker.client.sent == []
+    assert worker.client.confirmed == []
+
+    messages = await db.list_messages()
+    assert len(messages) == 1
+    assert messages[0]["kind"] == "outgoing"
+    assert messages[0]["chat_id"] == SESSION
+    assert messages[0]["sender_id"] == BUYER
+    assert "我已付款，等待你发货" in messages[0]["content"]

@@ -2379,9 +2379,13 @@ class Database:
             if row is not None:
                 return int(row["id"])
         if content:
+            # 只对「老库里没有 messageId」的行做内容兜底。已经有 messageId 的行
+            # 代表一条确定的历史消息，不能因为两句话一样就把它和后一条合并 ——
+            # 卖家在 3 分钟内重复发同一句话是很常见的。
             row = await self.fetch_one(
                 "SELECT id FROM messages WHERE account_id = ? AND chat_id = ? AND kind = ?"
-                " AND content = ? AND created_at BETWEEN datetime(?, '-180 seconds')"
+                " AND content = ? AND (external_id IS NULL OR external_id = '')"
+                " AND created_at BETWEEN datetime(?, '-180 seconds')"
                 " AND datetime(?, '+180 seconds') ORDER BY id DESC LIMIT 1",
                 (account_id, chat_id, kind, content, fields["created_at"], fields["created_at"]),
             )

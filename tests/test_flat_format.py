@@ -25,14 +25,15 @@ ORDER_ID = "2500000000000000001"
 SESSION = "61051610079"
 
 
-def flat(content, *, owner=MY, ext=BUYER, item_id=ITEM_ID, create_time=1777287861000):
+def flat(content, *, owner=MY, ext=BUYER, item_id=ITEM_ID, create_time=1777287861000,
+         receivers=None):
     return {
         "chatType": 1,
         "incrementType": 1,
         "sessionId": SESSION,
         "operation": {
             "content": content,
-            "receiverIds": [MY],
+            "receiverIds": [MY] if receivers is None else receivers,
             "sessionInfo": {
                 "sessionId": SESSION,
                 "ownerUserId": owner,
@@ -48,7 +49,7 @@ def flat(content, *, owner=MY, ext=BUYER, item_id=ITEM_ID, create_time=177728786
     }
 
 
-def paid_card():
+def paid_card(**kwargs):
     card = {
         "contentType": 26,
         "dxCard": {
@@ -61,7 +62,7 @@ def paid_card():
         },
     }
     data = base64.b64encode(json.dumps(card).encode()).decode()
-    return flat({"contentType": 26, "custom": {"type": 26, "data": data}})
+    return flat({"contentType": 26, "custom": {"type": 26, "data": data}}, **kwargs)
 
 
 def test_session_arouse_is_not_a_message():
@@ -112,10 +113,22 @@ def test_flat_plain_text():
     assert msg.item_id == ITEM_ID
 
 
-def test_own_message_is_dropped():
-    """自己发的消息（含多端同步）不能被当成买家消息。"""
+def test_own_message_is_recorded():
+    """自己发的消息（含多端同步）要落库，但不能当成买家消息触发自动回复。"""
     payload = flat({"contentType": 1, "text": {"text": "你好"}}, owner=MY, ext=MY)
-    assert parse_message(payload, my_id=MY) is None
+    msg = parse_message(payload, my_id=MY)
+    assert msg is not None
+    assert msg.from_me is True
+    assert msg.content == "你好"
+
+
+def test_own_plain_text_with_paid_keyword_is_not_buyer():
+    payload = flat({"contentType": 1, "text": {"text": "[我已付款，等待你发货]"}},
+                   owner=MY, ext=MY)
+    msg = parse_message(payload, my_id=MY)
+    assert msg is not None
+    assert msg.from_me is True
+    assert msg.sender_id == MY
 
 
 def test_buyer_side_view_uses_owner_as_sender():
@@ -196,3 +209,54 @@ def test_legacy_nested_format_still_works():
     assert msg is not None
     assert msg.order_id == ORDER_ID
     assert msg.item_id == ITEM_ID
+
+
+def test_own_message_from_another_client_uses_receiver_ids():
+    """receiverIds 不含我：这是我从闲鱼 App 发出的同步消息，不是买家消息。"""
+    payload = flat(
+        {"contentType": 1, "text": {"text": "你好"}},
+        owner=MY,
+        ext=BUYER,
+        receivers=[BUYER],
+    )
+    msg = parse_message(payload, my_id=MY)
+    assert msg is not None
+    assert msg.from_me is True
+    assert msg.sender_id == MY
+    assert msg.peer_id == BUYER
+
+
+def test_own_paid_card_from_another_client_is_not_buyer():
+    """自己在别的客户端发的付款卡片，也不能触发自动发货。"""
+    msg = parse_message(
+        paid_card(owner=MY, ext=BUYER, receivers=[BUYER]),
+        my_id=MY,
+    )
+    assert msg is not None
+    assert msg.from_me is True
+    assert msg.sender_id == MY
+    assert msg.peer_id == BUYER
+
+
+def test_incoming_message_with_self_in_receiver_ids_stays_incoming():
+    msg = parse_message(
+        flat({"contentType": 1, "text": {"text": "在吗"}}, receivers=[MY]),
+        my_id=MY,
+    )
+    assert msg is not None
+    assert msg.from_me is False
+    assert msg.sender_id == BUYER
+
+
+def test_flat_chat_id_strips_domain_suffix():
+    payload = flat({"contentType": 1, "text": {"text": "x"}})
+    payload["sessionId"] = SESSION + "@goofish"
+    payload["operation"]["sessionInfo"]["sessionId"] = SESSION + "@goofish"
+    msg = parse_message(payload, my_id=MY)
+    assert msg is not None
+    assert msg.chat_id == SESSION
+
+
+def test_string_content_type_8_is_still_ignored():
+    payload = flat({"contentType": "8", "sessionArouse": {}})
+    assert parse_message(payload, my_id=MY) is None

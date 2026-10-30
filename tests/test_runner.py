@@ -20,15 +20,19 @@ class FakeClient:
 
     user_id = "2000000000002"
 
-    def __init__(self) -> None:
+    def __init__(self, history: list[dict] | None = None) -> None:
         self.sent: list[tuple[str, str, str]] = []
         self.confirmed: list[str] = []
         self.acked: list[dict] = []
+        self.history = history or []
         self.websocket = self  # 仅用于内部判空
         self.fail_first = False
 
     async def ack(self, ws, frame):
         self.acked.append(frame)
+
+    async def list_conversation_messages(self, chat_id, limit=20, cursor=0):
+        return {"messages": list(self.history), "next_cursor": 0, "has_more": False}
 
     async def send_text_safe(self, chat_id, to_id, text):
         self.sent.append((chat_id, to_id, text))
@@ -192,12 +196,151 @@ async def test_unrelated_message_is_logged_only(db):
     assert messages[0]["content"] == "在吗？"
 
 
-async def test_self_message_is_ignored(db):
-    worker, _ = await build_worker(db)
-    payload = card_payload()
-    payload["1"]["10"]["senderUserId"] = "2000000000002"
+async def test_self_message_is_recorded_without_reply(db):
+    """卖家在闲鱼 App 里自己发的消息也要落库，但绝不能触发自动回复。"""
+    worker, account_id = await build_worker(db)
+    # 先有一条买家消息，自己消息没带 peer_id 时才知道该挂到谁名下。
+    await db.log_message(
+        account_id=account_id,
+        chat_id="47983389096",
+        sender_id="4100000001",
+        sender_name="买家小王",
+        content="在吗？",
+        kind="incoming",
+    )
+    payload = {
+        "1": {
+            "2": "47983389096@goofish",
+            "3": "pnm-self-1",
+            "5": 1742458817389,
+            "10": {
+                "reminderContent": "我自己发的",
+                "senderUserId": "2000000000002",
+                "senderNick": "我",
+            },
+        },
+    }
+
     await worker._on_frame(frame_with(payload))
+
     assert worker.client.sent == []
+    messages = await db.list_chat_messages(account_id, "47983389096")
+    assert sorted(m["kind"] for m in messages) == ["incoming", "outgoing"]
+    own = next(m for m in messages if m["kind"] == "outgoing")
+    assert own["content"] == "我自己发的"
+    assert own["sender_id"] == "4100000001"
+    assert own["external_id"] == "pnm-self-1"
+    # 卖家都回消息了，之前买家的未读红点应该清掉。
+    assert next(m for m in messages if m["kind"] == "incoming")["read_at"]
+
+
+async def test_self_plain_paid_keyword_is_logged_without_processing(db, monkeypatch):
+    """自己打的「我已付款」只是普通文本，不能冒充买家卡片触发处理。"""
+    from app.codec import IncomingMessage
+
+    worker, account_id = await build_worker(db)
+    await db.log_message(
+        account_id=account_id, chat_id="47983389096", sender_id="4100000001",
+        sender_name="买家小王", content="在吗？", kind="incoming",
+    )
+    processed: list[IncomingMessage] = []
+    original = worker._process_incoming
+
+    async def spy(msg, **kwargs):
+        processed.append(msg)
+        return await original(msg, **kwargs)
+
+    monkeypatch.setattr(worker, "_process_incoming", spy)
+    text = "我已付款，等待你发货"
+    payload = {
+        "messageId": "self-paid-plain-1",
+        "createAt": 1742458817389,
+        "cid": "47983389096@goofish",
+        "sender": {"uid": FakeClient.user_id + "@goofish"},
+        "content": {
+            "contentType": 101,
+            "custom": {
+                "type": 1,
+                "data": base64.b64encode(json.dumps(
+                    {"contentType": 1, "text": {"text": text}}, ensure_ascii=False
+                ).encode()).decode(),
+                "summary": text,
+            },
+        },
+        "extension": {
+            "reminderContent": text,
+            "senderUserId": FakeClient.user_id,
+            "extUserId": "4100000001",
+            "reminderUrl": "fleamarket://message_chat?itemId=900052644277&peerUserId=4100000001",
+        },
+    }
+
+    await worker._on_frame(frame_with(payload))
+    await worker._on_frame(frame_with(payload))  # 同一 messageId 重推不能变成两条
+
+    assert processed == []
+    assert worker.client.sent == []
+    rows = await db.list_chat_messages(account_id, "47983389096")
+    assert sorted(row["kind"] for row in rows) == ["incoming", "outgoing"]
+    own = next(row for row in rows if row["kind"] == "outgoing")
+    assert own["content"] == text
+    assert own["sender_id"] == "4100000001"
+    assert own["external_id"] == "self-paid-plain-1"
+
+
+async def test_outgoing_message_without_chat_id_is_ignored(db):
+    """畸形/空会话 ID 不能写出一条没有归属的孤儿消息。"""
+    from app.codec import IncomingMessage
+
+    worker, _ = await build_worker(db)
+    await worker._record_outgoing_message(IncomingMessage(
+        chat_id="   ", sender_id="", sender_name="", content="自己发的",
+        from_me=True, peer_id="4100000001",
+    ))
+    assert await db.list_messages() == []
+
+
+async def test_outgoing_message_never_uses_self_as_peer(db):
+    """对端字段被污染成卖家自己时，要回退到会话里的真实买家。"""
+    from app.codec import IncomingMessage
+
+    worker, account_id = await build_worker(db)
+    await db.log_message(
+        account_id=account_id, chat_id="c1", sender_id="4100000001",
+        sender_name="买家小王", content="在吗？", kind="incoming",
+    )
+    await worker._record_outgoing_message(IncomingMessage(
+        chat_id="c1", sender_id=FakeClient.user_id, sender_name="我",
+        content="自己发的", message_id="own-self-peer", from_me=True,
+        peer_id=FakeClient.user_id + "@goofish",
+    ))
+
+    rows = await db.list_chat_messages(account_id, "c1")
+    own = next(row for row in rows if row["kind"] == "outgoing")
+    assert own["sender_id"] == "4100000001"
+    assert own["sender_id"] != FakeClient.user_id
+    assert await db.chat_peer_id(account_id, "c1") == "4100000001"
+
+
+async def test_sync_history_never_uses_self_as_peer(db):
+    """补拉历史时服务端/脏库给了自己当对端，也不能写进 sender_id。"""
+    history = [{
+        "chat_id": "c1", "buyer_id": "", "peer_id": FakeClient.user_id + "@goofish",
+        "buyer_name": "", "content": "我回的", "created_at": 1767225601000,
+        "message_id": "m-self-peer", "from_me": True,
+    }]
+    worker, account_id = await build_worker(db)
+    worker.client.history = history  # type: ignore[union-attr]
+    await db.log_message(
+        account_id=account_id, chat_id="c1", sender_id="4100000001",
+        sender_name="买家小王", content="在吗？", kind="incoming",
+    )
+
+    assert await worker.sync_chat_history("c1") == 1
+    own = next(row for row in await db.list_chat_messages(account_id, "c1")
+               if row["kind"] == "outgoing")
+    assert own["sender_id"] == "4100000001"
+    assert await db.chat_peer_id(account_id, "c1") == "4100000001"
 
 
 async def test_invalid_cookie_is_cookie_expired_not_endless_retry(db):

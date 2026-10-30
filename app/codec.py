@@ -178,6 +178,24 @@ _ITEM_ID_PATTERNS = (
 )
 
 
+def _url_param(url: Any, name: str) -> str:
+    """从 fleamarket://...?a=1&b=2 这类伪 URL 里取参数值。"""
+    if not isinstance(url, str) or not url:
+        return ""
+    match = re.search(rf"[?&]{re.escape(name)}=([^&#]+)", url)
+    return match.group(1).strip() if match else ""
+
+
+def _normalize_user_id(value: Any) -> str:
+    """统一用户 ID：去掉 @goofish 之类的域后缀和首尾空白。
+
+    闲鱼的 cid / sender.uid 经常带域名后缀，但会话 extension 里的
+    extUserId、URL 参数不一定带。比较“是不是自己”和落库前必须先归一化，
+    否则同一个账号会变成两个 ID。
+    """
+    return str(value or "").split("@", 1)[0].strip()
+
+
 class DecodeError(ValueError):
     """消息负载无法解包。"""
 
@@ -416,6 +434,28 @@ def is_paid_trigger(content: str) -> bool:
     return any(word in content for word in PAID_KEYWORDS)
 
 
+#: 只有这些 contentType 才可能是交易卡片。25=评价提醒，26=交易卡片，36=卡片消息。
+_PAID_CARD_CONTENT_TYPES = frozenset({25, 26, 36})
+
+
+def _is_paid_card_trigger(content: str, content_type: Any = None,
+                          payload: dict[str, Any] | None = None) -> bool:
+    """是不是一张「买家已付款」的交易卡片。
+
+    光看正文不够：卖家自己在聊天框里打一句「我已付款，等待你发货」也是合法
+    文本，不能因此把发送方从自己改成买家。必须同时满足「已付款触发语」和
+    「卡片形态」；卡片形态只认结构键名 / contentType，不扫正文值。
+    """
+    if not is_paid_trigger(content):
+        return False
+    if _payload_is_card(payload):
+        return True
+    try:
+        return int(content_type) in _PAID_CARD_CONTENT_TYPES
+    except (TypeError, ValueError):
+        return False
+
+
 def is_ignored(content: str) -> bool:
     """判断一条消息是否属于「只记录不处理」的系统提示。"""
     if not content:
@@ -466,6 +506,12 @@ class IncomingMessage:
     media_width: int | None = None
     media_height: int | None = None
     media_duration: int | None = None
+    #: 这条消息是不是当前账号自己发的（多端同步 / 网页后台发的）。
+    #: 自己发的消息只记聊天记录，绝不能进入自动回复/发货流程。
+    from_me: bool = False
+    #: 会话对端（买家）ID。自己发的消息 sender_id 可能是自己，
+    #: 落库时要靠它把消息挂到正确的会话买家名下。
+    peer_id: str = ""
 
 
 def _b64_json(value: Any) -> dict[str, Any]:
@@ -641,29 +687,57 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
     extensions = _as_dict(session_info.get("extensions"))
 
     content_type = content.get("contentType")
+    if isinstance(content_type, str) and content_type.isdigit():
+        content_type = int(content_type)
     if content_type == 8:
         # 会话引导（「现在买可以做吗？」这类系统建议），不是真消息
         return None
 
     chat_id = str(raw.get("sessionId") or session_info.get("sessionId") or "").strip()
+    if "@" in chat_id:
+        chat_id = chat_id.split("@", 1)[0].strip()
     if not chat_id:
         return None
 
-    owner_id = str(session_info.get("ownerUserId") or extensions.get("ownerUserId") or "").strip()
-    ext_id = str(extensions.get("extUserId") or "").strip()
-    seller_id = str(extensions.get("itemSellerId") or "").strip()
+    my_id = _normalize_user_id(my_id)
+    owner_id = _normalize_user_id(
+        session_info.get("ownerUserId") or extensions.get("ownerUserId")
+    )
+    ext_id = _normalize_user_id(extensions.get("extUserId"))
+    seller_id = _normalize_user_id(extensions.get("itemSellerId"))
+
+    # receiverIds 是服务端给出的收件人列表。若它不含当前账号，说明这条是
+    # 当前账号从别的端（闲鱼 App / 网页）发出去的同步消息，不能只靠
+    # owner/ext 的启发式当成买家消息，否则会触发自动回复甚至误发货。
+    receivers: list[str] = []
+    raw_receivers = operation.get("receiverIds")
+    if isinstance(raw_receivers, list):
+        for item in raw_receivers:
+            if not isinstance(item, (str, int)):
+                continue
+            uid = _normalize_user_id(item)
+            if uid:
+                receivers.append(uid)
+    sent_from_me = bool(my_id and receivers and my_id not in receivers)
 
     # 谁发的：owner 是会话主人（卖家）。我是 owner 就说明是买家发来的。
-    if my_id and owner_id == my_id:
+    if sent_from_me:
+        sender_id = my_id
+    elif my_id and owner_id == my_id:
         sender_id = ext_id
     elif my_id and ext_id == my_id:
         sender_id = owner_id or seller_id
     else:
         sender_id = ext_id or owner_id
 
-    if my_id and sender_id == my_id:
-        # 自己发的（含多端同步），交给上层过滤
-        return None
+    # 自己发的（含多端同步）：不再丢弃，交给上层只记聊天记录、不自动回复。
+    from_me = sent_from_me or (bool(my_id) and bool(sender_id) and sender_id == my_id)
+    peer_id = ext_id if ext_id and ext_id != my_id else ""
+    if from_me and not peer_id:
+        for candidate in (owner_id, seller_id, receivers[0] if receivers else ""):
+            if candidate and candidate != my_id:
+                peer_id = candidate
+                break
 
     inner = decode_custom(content)
     texts = collect_texts(inner, content)
@@ -702,6 +776,8 @@ def _parse_flat(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         media_width=media_w,
         media_height=media_h,
         media_duration=media_d,
+        from_me=from_me,
+        peer_id=peer_id,
     )
 
 
@@ -955,9 +1031,10 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
     if not chat_id or _has_cjk(chat_id):
         return None
 
-    sender_id = str(sender.get("uid") or "").split("@")[0].strip()
+    my_id = _normalize_user_id(my_id)
+    sender_id = _normalize_user_id(sender.get("uid"))
     if not sender_id:
-        sender_id = str(extension.get("senderUserId") or "").split("@")[0].strip()
+        sender_id = _normalize_user_id(extension.get("senderUserId"))
 
     texts: list[str] = []
     for value in (extension.get("reminderContent"), extension.get("detailNotice")):
@@ -998,10 +1075,20 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
     if not content_text.strip() and not sender_id:
         return None
 
-    # 自己发的消息要丢掉（避免自问自答），但「已付款」类交易卡片例外：
-    # 实测这类系统卡片会把 senderUserId 记成卖家自己，一律过滤会把订单丢掉。
-    if my_id and sender_id == my_id and not is_paid_trigger(content_text):
-        return None
+    # 自己发的消息不再丢弃（要落聊天记录），但绝不能进入自动回复。
+    # 「已付款」交易卡片例外：实测这类卡片可能把 senderUserId 记成卖家自己。
+    # 只有「卡片形态 + 已付款触发语 + 有可信且非自己的对端」三个条件同时成立，
+    # 才恢复成买家消息；否则一律按自己发的消息处理，绝不能用自己当 sender
+    # 进入自动回复/发货流程。
+    from_me = bool(my_id) and bool(sender_id) and sender_id == my_id
+    peer_id = _normalize_user_id(extension.get("extUserId"))
+    if not peer_id:
+        peer_id = _normalize_user_id(_url_param(reminder_url, "peerUserId"))
+    if peer_id == my_id:
+        peer_id = ""
+    if from_me and peer_id and _is_paid_card_trigger(content_text, content_type, inner):
+        sender_id = peer_id
+        from_me = False
 
     msg_type, media_url, media_thumb, media_w, media_h, media_d = extract_media_ref(inner)
     return IncomingMessage(
@@ -1024,6 +1111,8 @@ def _decode_message_object(obj: dict[str, Any], my_id: str) -> IncomingMessage |
         media_height=media_h,
         media_duration=media_d,
         order_id_trusted=order_trusted,
+        from_me=from_me,
+        peer_id=peer_id,
     )
 
 
@@ -1060,12 +1149,12 @@ def _parse_numbered(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         # 会话 ID 位置出现中文，说明字段错位，宁可丢掉也不要错发
         return None
 
-    sender_id = str(
-        sender_info.get("1") or sender_info.get("senderUserId") or reminder.get("senderUserId") or ""
+    my_id = _normalize_user_id(my_id)
+    sender_id = _normalize_user_id(
+        sender_info.get("1") or sender_info.get("senderUserId") or reminder.get("senderUserId")
     )
-    sender_id = sender_id.split("@")[0].strip()
-    if my_id and sender_id == my_id:
-        return None
+    # 自己发的（含多端同步）：不丢弃，只记聊天记录；peer_id 交给 DB 回退。
+    from_me = bool(my_id) and bool(sender_id) and sender_id == my_id
 
     sender_name = pick_display_name(
         sender_info.get("2"), reminder.get("senderNick"), reminder.get("reminderTitle"), fallback=""
@@ -1133,11 +1222,12 @@ def _parse_numbered(raw: dict[str, Any], my_id: str) -> IncomingMessage | None:
         media_width=media_w,
         media_height=media_h,
         media_duration=media_d,
+        from_me=from_me,
     )
 
 
 def parse_message(raw: dict[str, Any], my_id: str = "") -> IncomingMessage | None:
-    """把一条推送负载解析成 :class:`IncomingMessage`；不是买家消息时返回 ``None```。
+    """把一条推送负载解析成 :class:`IncomingMessage`；不是聊天消息时返回 ``None```。
 
     闲鱼一共推过三种格式，都要认，否则真实消息会被整条丢掉 ——
     而「丢掉了」在日志里看起来跟「没人发消息」一模一样：
@@ -1150,6 +1240,7 @@ def parse_message(raw: dict[str, Any], my_id: str = "") -> IncomingMessage | Non
         # 未读通知：只有会话 ID，没有正文，当消息处理只会得到空内容
         return None
 
+    my_id = _normalize_user_id(my_id)
     if "operation" in raw and "chatType" in raw:
         parsed = _parse_flat(raw, my_id)
         if parsed is not None:

@@ -153,6 +153,21 @@ async def test_synced_history_dedupes_against_polled_messages(db):
     assert [row["content"] for row in rows] == ["老消息", "新消息"]
 
 
+async def test_synced_same_text_with_distinct_message_ids_is_not_merged(db):
+    """两句话一样但 messageId 不同，是两条消息，不能按内容兜底吃掉一条。"""
+    account_id = await db.upsert_account("主号", "cookie")
+    for external_id in ("m-1", "m-2"):
+        await db.log_synced_message(
+            account_id=account_id, chat_id="c1", sender_id="b1", sender_name="买家小王",
+            content="在吗？", kind="outgoing", external_id=external_id,
+            created_at="2026-01-01 10:00:00",
+        )
+
+    rows = await db.list_chat_messages(account_id, "c1")
+    assert len(rows) == 2
+    assert {row["external_id"] for row in rows} == {"m-1", "m-2"}
+
+
 # --------------------------------------------------- 商品名（聊天列表显示用）
 
 
@@ -303,11 +318,11 @@ async def test_manual_send_requires_connection_and_text(db):
         await worker.send_manual_text("c1", "b1", "x" * 2001)
 
 
-async def test_sync_history_only_writes_incoming_and_dedupes(db):
+async def test_sync_history_writes_incoming_and_outgoing_and_dedupes(db):
     history = [
         {"chat_id": "c1", "buyer_id": "b1", "buyer_name": "买家小王", "content": "第一句",
          "created_at": 1767225600000, "message_id": "m1", "from_me": False},
-        {"chat_id": "c1", "buyer_id": "", "buyer_name": "", "content": "我回的",
+        {"chat_id": "c1", "buyer_id": "", "peer_id": "b1", "buyer_name": "", "content": "我回的",
          "created_at": 1767225601000, "message_id": "m2", "from_me": True},
         {"chat_id": "c1", "buyer_id": "b1", "buyer_name": "买家小王", "content": "第二句",
          "created_at": 1767225602000, "message_id": "m3", "from_me": False},
@@ -315,15 +330,16 @@ async def test_sync_history_only_writes_incoming_and_dedupes(db):
     worker, account_id = await build_worker(db, FakeClient(history))
 
     handled = await worker.sync_chat_history("c1", limit=50)
-    assert handled == 2
+    assert handled == 3
     rows = await db.list_chat_messages(account_id, "c1")
-    assert [row["content"] for row in rows] == ["第一句", "第二句"]
+    assert [row["content"] for row in rows] == ["第一句", "我回的", "第二句"]
+    assert [row["kind"] for row in rows] == ["incoming", "outgoing", "incoming"]
     assert all(row["read_at"] for row in rows)
     assert await db.chat_peer_id(account_id, "c1") == "b1"
 
     await worker.sync_chat_history("c1", limit=50)
     rows = await db.list_chat_messages(account_id, "c1")
-    assert len(rows) == 2, "同一条历史消息反复同步不能变成多条"
+    assert len(rows) == 3, "同一条历史消息反复同步不能变成多条"
 
 
 async def test_ensure_chat_reuses_history_or_creates_one(db):
